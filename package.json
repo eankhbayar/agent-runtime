@@ -1,0 +1,62 @@
+{
+  "name": "@eankhbayar/pi-runtime",
+  "version": "0.1.0",
+  "description": "Run a pi coding agent inside a sandbox: run-event contract, in-sandbox runner, dispatcher, Docker provider and egress gateway.",
+  "license": "UNLICENSED",
+  "private": true,
+  "type": "module",
+  "repository": "github:eankhbayar/pi-runtime",
+  "files": [
+    "dist",
+    "gateway"
+  ],
+  "exports": {
+    "./contract": {
+      "types": "./dist/contract/index.d.ts",
+      "default": "./dist/contract/index.js"
+    },
+    "./runner": {
+      "types": "./dist/runner/index.d.ts",
+      "default": "./dist/runner/index.js"
+    },
+    "./dispatcher": {
+      "types": "./dist/dispatcher/index.d.ts",
+      "default": "./dist/dispatcher/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "default": "./dist/testing/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "ready": "pnpm typecheck && pnpm test && pnpm build",
+    "release": "node scripts/release.mjs"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.85.1 <1",
+    "typebox": "^1.3.30"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@types/node": "^24",
+    "typebox": "^1.3.30",
+    "typescript": "^7.0.2",
+    "vitest": "^4"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "packageManager": "pnpm@12.0.0"
+}
