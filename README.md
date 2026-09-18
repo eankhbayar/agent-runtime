@@ -99,6 +99,8 @@ Needs Docker (any context: Colima, Docker Desktop, a remote host) and a key for 
 5. **Write the host script** (the "On the host" snippet). The smallest sink prints to the terminal:
 
    ```ts
+   import { writeFile } from "node:fs/promises";
+
    import { LIVE, printRunEvent, type EventSink } from "@eankhbayar/pi-runtime/dispatcher";
 
    const started = Date.now();
@@ -108,7 +110,10 @@ Needs Docker (any context: Colima, Docker Desktop, a remote host) and a key for 
        return LIVE;
      },
      samples: async () => {},
-     artifact: async ({ fileName, bytes }) => (await writeFile(`out/${fileName}`, bytes), fileName),
+     artifact: async ({ fileName, bytes }) => {
+       await writeFile(`out/${fileName}`, bytes);
+       return fileName; // the id that lands in the artifact event
+     },
      log: (message) => console.error(message),
    };
    ```
