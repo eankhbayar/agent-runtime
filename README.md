@@ -75,6 +75,52 @@ const outcome = await executeRun({
 
 Build the gateway image from the installed package: `docker build -t myproject-egress-gateway node_modules/@eankhbayar/pi-runtime/gateway`.
 
+## Run it in a project
+
+Needs Docker (any context: Colima, Docker Desktop, a remote host) and a key for an Anthropic-format Messages endpoint.
+
+1. **Install** the tag (see Install) and, in the project that holds the runner, `@earendil-works/pi-coding-agent` and `typebox`.
+2. **Write the runner** (`runner.ts`, the "In the sandbox" snippet): the project's prompt, tools and default model.
+3. **Build the sandbox image.** It needs Node 22.18+, whatever the agent's tools call (Python, DuckDB, ripgrep…), pi and typebox installed with npm, this package copied into `node_modules`, and the runner. It must run as a non-root user that owns `/workspace`:
+
+   ```dockerfile
+   FROM node:24-bookworm-slim
+   COPY sandbox/package.json /opt/runner/package.json      # pi-coding-agent and typebox only
+   RUN cd /opt/runner && npm install --omit=dev --ignore-scripts
+   COPY .image/pi-runtime /opt/runner/node_modules/@eankhbayar/pi-runtime   # package.json + dist/, staged from the host's node_modules
+   COPY runner.ts /opt/runner/runner.ts
+   RUN mkdir -p /workspace && chown node:node /workspace
+   USER node
+   WORKDIR /workspace
+   ENV PI_OFFLINE=1
+   ```
+
+4. **Build the gateway image:** `docker build -t myproject-egress-gateway node_modules/@eankhbayar/pi-runtime/gateway`.
+5. **Write the host script** (the "On the host" snippet). The smallest sink prints to the terminal:
+
+   ```ts
+   import { LIVE, printRunEvent, type EventSink } from "@eankhbayar/pi-runtime/dispatcher";
+
+   const started = Date.now();
+   const sink: EventSink = {
+     events: async (batch) => {
+       for (const event of batch) printRunEvent(event, () => `${((Date.now() - started) / 1000).toFixed(1)}s`);
+       return LIVE;
+     },
+     samples: async () => {},
+     artifact: async ({ fileName, bytes }) => (await writeFile(`out/${fileName}`, bytes), fileName),
+     log: (message) => console.error(message),
+   };
+   ```
+
+6. **Run it:** `PROVIDER_API_KEY=... node run.ts --prompt "..."`, passing the key as `llm.apiKey` to `gateway.ensure`. The key is needed only when the gateway container has to start; later runs reuse it. `gateway.ensure({ ..., restart: true })` after changing the key or the gateway image.
+
+To check an image without calling a model: `docker run --rm myproject-runner node /opt/runner/runner.ts --check`.
+
+After taking a new tag, rebuild both images. Sandboxes kept with `keepSandbox` stay on the image they were created from; `reapSandboxes` destroys idle ones.
+
+A worked example is HKJC's `packages/analysis-runner`: `dispatcher/runtime.ts` (setup), `dispatcher/run-local.ts` (terminal CLI with isolation checks), `dispatcher/serve.ts` (a service with a Convex sink and the reaper), `scripts/stage-runtime.ts` (staging for the image build).
+
 A different sandbox platform is one more `SandboxProvider`; nothing else changes.
 
 ## Develop
