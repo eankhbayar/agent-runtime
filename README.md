@@ -1,13 +1,14 @@
-# @eankhbayar/pi-runtime
+# @eankhbayar/agent-runtime
 
-Runs a [pi](https://github.com/earendil-works/pi) coding agent inside a sandbox and streams what it does as a stable event log. Extracted from the HKJC analysis runtime.
+Runtimes for running coding agents inside a sandbox and streaming what they do as a stable event log. One runtime today, `pi`; others sit beside it as they arrive. Extracted from the HKJC analysis runtime.
 
 ```text
-src/contract/     run events, the JSON-lines emitter and parser, and the fold into a view. No Node APIs, so a web app can import it.
-src/runner/       runs in the sandbox: `runAgent`, the pi event adapter, the `save_output` tool
-src/dispatcher/   runs on the host: `executeRun`, the `SandboxProvider` interface, the Docker provider, the reaper, gateway control
-src/testing/      `FakeSandboxProvider` and `FakeSink`, to drive `executeRun` in a project's tests
-gateway/          egress gateway image: holds the provider key, proxies Anthropic-format Messages calls for valid run tokens
+src/pi/             the pi runtime, imported as @eankhbayar/agent-runtime/pi/<part>
+  contract/         run events, the JSON-lines emitter and parser, and the fold into a view. No Node APIs, so a web app can import it.
+  runner/           runs in the sandbox: `runAgent`, the pi event adapter, the `save_output` tool
+  dispatcher/       runs on the host: `executeRun`, the `SandboxProvider` interface, the Docker provider, the reaper, gateway control
+  testing/          `FakeSandboxProvider` and `FakeSink`, to drive `executeRun` in a project's tests
+gateway/            egress gateway image, shared by every runtime: holds the provider key, proxies Anthropic-format Messages calls for valid run tokens
 ```
 
 ## Install
@@ -15,21 +16,21 @@ gateway/          egress gateway image: holds the provider key, proxies Anthropi
 Releases are git tags that carry their built `dist/`:
 
 ```json
-{ "dependencies": { "@eankhbayar/pi-runtime": "github:eankhbayar/pi-runtime#v0.1.0" } }
+{ "dependencies": { "@eankhbayar/agent-runtime": "github:eankhbayar/agent-runtime#v0.2.0" } }
 ```
 
 The repo is private, so whatever installs it needs read access: locally, git's credential helper (`gh auth setup-git`); in CI, a token, for example
 
 ```yaml
-- run: git config --global url."https://x-access-token:${{ secrets.PI_RUNTIME_TOKEN }}@github.com/".insteadOf "https://github.com/"
+- run: git config --global url."https://x-access-token:${{ secrets.AGENT_RUNTIME_TOKEN }}@github.com/".insteadOf "https://github.com/"
 ```
 
-`@earendil-works/pi-coding-agent` and `typebox` are peer dependencies, needed only where `./runner` is imported.
+`@earendil-works/pi-coding-agent` and `typebox` are peer dependencies, needed only where `./pi/runner` is imported.
 
 ## In the sandbox
 
 ```ts
-import { createSaveOutputTool, runAgent } from "@eankhbayar/pi-runtime/runner";
+import { createSaveOutputTool, runAgent } from "@eankhbayar/agent-runtime/pi/runner";
 
 await runAgent({
   defaultModel: { provider: "kimi-coding", model: "kimi-for-coding" },
@@ -47,7 +48,7 @@ The sandbox image is the project's own. Node will not strip types from files und
 ## On the host
 
 ```ts
-import { createGateway, DockerSandboxProvider, executeRun, sampleUsage } from "@eankhbayar/pi-runtime/dispatcher";
+import { createGateway, DockerSandboxProvider, executeRun, sampleUsage } from "@eankhbayar/agent-runtime/pi/dispatcher";
 
 const gateway = createGateway({ container: "myproject-egress-gateway" });
 await gateway.ensure({ image: "myproject-egress-gateway", llm });
@@ -73,7 +74,7 @@ const outcome = await executeRun({
 });
 ```
 
-Build the gateway image from the installed package: `docker build -t myproject-egress-gateway node_modules/@eankhbayar/pi-runtime/gateway`.
+Build the gateway image from the installed package: `docker build -t myproject-egress-gateway node_modules/@eankhbayar/agent-runtime/gateway`.
 
 ## Run it in a project
 
@@ -87,7 +88,7 @@ Needs Docker (any context: Colima, Docker Desktop, a remote host) and a key for 
    FROM node:24-bookworm-slim
    COPY sandbox/package.json /opt/runner/package.json      # pi-coding-agent and typebox only
    RUN cd /opt/runner && npm install --omit=dev --ignore-scripts
-   COPY .image/pi-runtime /opt/runner/node_modules/@eankhbayar/pi-runtime   # package.json + dist/, staged from the host's node_modules
+   COPY .image/agent-runtime /opt/runner/node_modules/@eankhbayar/agent-runtime   # package.json + dist/, staged from the host's node_modules
    COPY runner.ts /opt/runner/runner.ts
    RUN mkdir -p /workspace && chown node:node /workspace
    USER node
@@ -95,13 +96,13 @@ Needs Docker (any context: Colima, Docker Desktop, a remote host) and a key for 
    ENV PI_OFFLINE=1
    ```
 
-4. **Build the gateway image:** `docker build -t myproject-egress-gateway node_modules/@eankhbayar/pi-runtime/gateway`.
+4. **Build the gateway image:** `docker build -t myproject-egress-gateway node_modules/@eankhbayar/agent-runtime/gateway`.
 5. **Write the host script** (the "On the host" snippet). The smallest sink prints to the terminal:
 
    ```ts
    import { writeFile } from "node:fs/promises";
 
-   import { LIVE, printRunEvent, type EventSink } from "@eankhbayar/pi-runtime/dispatcher";
+   import { LIVE, printRunEvent, type EventSink } from "@eankhbayar/agent-runtime/pi/dispatcher";
 
    const started = Date.now();
    const sink: EventSink = {
