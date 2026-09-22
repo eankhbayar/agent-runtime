@@ -12,7 +12,7 @@ const COMMAND = ["node", "/opt/runner/runner.js"];
 let mounts: Mount[] = [];
 
 beforeAll(async () => {
-  const localDir = await mkdtemp(path.join(tmpdir(), "pi-runtime-mount-"));
+  const localDir = await mkdtemp(path.join(tmpdir(), "agent-runtime-mount-"));
   await writeFile(path.join(localDir, "data.duckdb"), "rows");
   mounts = [{ localDir, remoteDir: "/data", verify: { "data.duckdb": "upload-hash" } }];
 });

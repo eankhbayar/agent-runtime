@@ -1,5 +1,5 @@
 // Tags a release that carries its built `dist/`, so a project can depend on
-// `github:eankhbayar/pi-runtime#v<version>` without building anything.
+// `github:eankhbayar/agent-runtime#v<version>` without building anything.
 // `dist/` stays out of main: the tag points at a commit one step off it.
 //
 //   pnpm release          build, tag v<package.json version>, push main and the tag

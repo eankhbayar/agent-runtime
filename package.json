@@ -1,31 +1,31 @@
 {
-  "name": "@eankhbayar/pi-runtime",
-  "version": "0.1.0",
-  "description": "Run a pi coding agent inside a sandbox: run-event contract, in-sandbox runner, dispatcher, Docker provider and egress gateway.",
+  "name": "@eankhbayar/agent-runtime",
+  "version": "0.2.0",
+  "description": "Runtimes for sandboxed coding agents. `pi`: run-event contract, in-sandbox runner, dispatcher, Docker provider and egress gateway for the pi coding agent.",
   "license": "UNLICENSED",
   "private": true,
   "type": "module",
-  "repository": "github:eankhbayar/pi-runtime",
+  "repository": "github:eankhbayar/agent-runtime",
   "files": [
     "dist",
     "gateway"
   ],
   "exports": {
-    "./contract": {
-      "types": "./dist/contract/index.d.ts",
-      "default": "./dist/contract/index.js"
+    "./pi/contract": {
+      "types": "./dist/pi/contract/index.d.ts",
+      "default": "./dist/pi/contract/index.js"
     },
-    "./runner": {
-      "types": "./dist/runner/index.d.ts",
-      "default": "./dist/runner/index.js"
+    "./pi/runner": {
+      "types": "./dist/pi/runner/index.d.ts",
+      "default": "./dist/pi/runner/index.js"
     },
-    "./dispatcher": {
-      "types": "./dist/dispatcher/index.d.ts",
-      "default": "./dist/dispatcher/index.js"
+    "./pi/dispatcher": {
+      "types": "./dist/pi/dispatcher/index.d.ts",
+      "default": "./dist/pi/dispatcher/index.js"
     },
-    "./testing": {
-      "types": "./dist/testing/index.d.ts",
-      "default": "./dist/testing/index.js"
+    "./pi/testing": {
+      "types": "./dist/pi/testing/index.d.ts",
+      "default": "./dist/pi/testing/index.js"
     },
     "./package.json": "./package.json"
   },

@@ -41,7 +41,7 @@ function tokenFile(token: string): string {
 export function createGateway(options: GatewayOptions): Gateway {
   const container = options.container;
   const alias = options.alias ?? "gateway";
-  const upstreamLabel = "pi-runtime.gateway.upstream";
+  const upstreamLabel = "agent-runtime.gateway.upstream";
 
   return {
     container,
@@ -81,7 +81,7 @@ export function createGateway(options: GatewayOptions): Gateway {
           "--restart",
           "unless-stopped",
           "--label",
-          "pi-runtime.gateway=1",
+          "agent-runtime.gateway=1",
           "--label",
           `${upstreamLabel}=${opts.llm.messagesUrl}`,
           "--cap-drop",

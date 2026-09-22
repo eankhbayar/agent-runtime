@@ -400,7 +400,7 @@ async function upload(
   if (!remotePath) return null;
   const fileName = path.posix.basename(remotePath);
   try {
-    const dir = await mkdtemp(path.join(tmpdir(), "pi-runtime-output-"));
+    const dir = await mkdtemp(path.join(tmpdir(), "agent-runtime-output-"));
     await opts.provider.download(sandboxId, remotePath, dir);
     const bytes = await readFile(path.join(dir, fileName));
     return await opts.sink.artifact({
