@@ -31,6 +31,10 @@
       "types": "./dist/dispatch/cloud-run/index.d.ts",
       "default": "./dist/dispatch/cloud-run/index.js"
     },
+    "./job": {
+      "types": "./dist/job/index.d.ts",
+      "default": "./dist/job/index.js"
+    },
     "./testing": {
       "types": "./dist/testing/index.d.ts",
       "default": "./dist/testing/index.js"
