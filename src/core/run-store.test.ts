@@ -2,7 +2,14 @@ import { describe, expect, it } from "vitest";
 
 import { FakeSink } from "../testing/fakes.ts";
 import { LIVE } from "./run.ts";
-import type { ClaimedRun, ClaimRequest, RunStore } from "./run-store.ts";
+import type {
+  ClaimedRun,
+  ClaimRequest,
+  EndingOf,
+  PayloadOf,
+  RunStore,
+  SettledOf,
+} from "./run-store.ts";
 
 // What a harness written against RunStore alone sees of an adapter's claim.
 
@@ -28,7 +35,7 @@ function legalStore(): RunStore<LegalClaim> {
   };
 }
 
-/** A harness generic over the claim, as phase 2's job harness will be. */
+/** A harness generic over the claim, as runJob is. */
 async function claimFor<Claim extends ClaimedRun<unknown, never, unknown>>(
   store: RunStore<Claim>,
   runId: string,
@@ -38,7 +45,19 @@ async function claimFor<Claim extends ClaimedRun<unknown, never, unknown>>(
   return claim;
 }
 
+/** True when A and B are the same type. */
+type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+
 describe("RunStore", () => {
+  it("names a claim's payload, ending and settlement for a harness's signature", () => {
+    const named: [
+      Same<PayloadOf<LegalClaim>, { question: string }>,
+      Same<EndingOf<LegalClaim>, Ending>,
+      Same<SettledOf<LegalClaim>, Settled>,
+    ] = [true, true, true];
+    expect(named).toEqual([true, true, true]);
+  });
+
   it("hands a harness the adapter's own claim, methods and all", async () => {
     const claim = await claimFor(legalStore(), "run_1");
     expect(claim.payload.question).toBe("Is the clause enforceable?");
