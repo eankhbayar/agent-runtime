@@ -2,7 +2,7 @@
 
 Runtimes for running coding agents inside a sandbox and streaming what they do as a stable event log. One runtime today, `pi`; others sit beside it as they arrive. Extracted from the HKJC analysis runtime.
 
-Each directory under `src/` is imported as `@eankhbayar/agent-runtime/<dir>`:
+Each directory below is imported by its path under `src/`, e.g. `@eankhbayar/agent-runtime/providers/docker`:
 
 ```text
 src/contract/         run events, the JSON-lines emitter and parser, and the fold into a view. No Node APIs, so a web app can import it.
@@ -134,14 +134,42 @@ A different sandbox platform is one more `SandboxProvider`; nothing else changes
 
 ## Stores
 
-`EventSink` is all `executeRun` writes to. A worker that claims runs itself, such as a job started for one run, uses a `RunStore`: `claim({ runId, idempotencyKey })` returns a `ClaimedRun` that is the run's sink, with the app's payload, `heartbeat()` and `finish(ending)`:
+`EventSink` is all `executeRun` writes to. A worker that claims runs itself, such as a job started for one run, uses a `RunStore`: `claim({ runId, idempotencyKey })` returns a `ClaimedRun` that is the run's sink, with the app's payload, `heartbeat()` and `finish(ending)`. `executeRun` never beats or finishes, so the caller does both; a store fails a run that goes quiet (HKJC's after 90 s):
 
 ```ts
 const claim = await store.claim({ runId, idempotencyKey });
-if (claim) await claim.finish(await executeRun({ ...options, sink: claim, runId, prompt: claim.payload.prompt }));
+if (claim) {
+  const stop = new AbortController();
+  const beat = setInterval(() => {
+    void claim.heartbeat().then((state) => {
+      if (state.cancelled || state.gone) stop.abort();
+    }, () => {});
+  }, claim.heartbeatMs);
+  try {
+    const { status, error, answerText, usage } = await executeRun({
+      ...options, sink: claim, runId, prompt: claim.payload.prompt, signal: stop.signal,
+    });
+    await claim.finish({ status, error, answerText, usage }); // not the whole outcome: a store's validator rejects its events
+  } catch (cause) {
+    await claim.finish({ status: "failed", error: String(cause) });
+  } finally {
+    clearInterval(beat);
+  }
+}
 ```
 
-The ending defaults to status, error, answer and usage, which a `RunOutcome` has; an app with endings of its own (a pause for review, say) passes its type. How HKJC's Convex functions and hk-legal's protocol 5 map onto it is at the top of `src/core/run-store.ts`.
+A claim rejects with `StoreUnreachableError` when no answer came back; retry that with the same key, so a claim that landed comes back. Any other rejection is the store refusing, and is not retried. An app with endings of its own (a pause for review, say), a richer answer from `finish`, or methods of its own on the claim types the store by its claim: `RunStore<MyClaim>`, where `MyClaim` extends `ClaimedRun<Payload, Ending, Settled>`. How HKJC's Convex functions and hk-legal's protocol 5 map onto it is at the top of `src/core/run-store.ts`.
+
+## Upgrading from 0.2
+
+`./pi/runner` is unchanged. The other `./pi/*` paths are gone:
+
+```text
+pi/contract     -> contract
+pi/testing      -> testing
+pi/dispatcher   -> core               executeRun, EventSink, SinkState, LIVE, TokenGrant, Mount, ArtifactUpload, RunOutcome, SandboxProvider and its types, Usage, the reaper, printRunEvent
+                -> providers/docker   docker, DockerError, DockerSandboxProvider, sampleUsage, parseDockerStats, createGateway, Gateway, LlmConfig
+```
 
 ## Develop
 
