@@ -2,7 +2,13 @@
 // finishes them. Each claim is a FakeSink, so it also records what the run wrote.
 
 import type { SinkState } from "../core/run.ts";
-import type { ClaimedRun, ClaimRequest, RunEnding, RunStore } from "../core/run-store.ts";
+import {
+  StoreUnreachableError,
+  type ClaimedRun,
+  type ClaimRequest,
+  type RunEnding,
+  type RunStore,
+} from "../core/run-store.ts";
 
 import { FakeSink } from "./fakes.ts";
 
@@ -41,7 +47,7 @@ export class FakeClaim<Payload, Ending = RunEnding>
 }
 
 export class FakeRunStore<Payload = unknown, Ending = RunEnding>
-  implements RunStore<Payload, Ending>
+  implements RunStore<FakeClaim<Payload, Ending>>
 {
   /** Runs not yet claimed, by id. */
   readonly waiting: Map<string, Payload>;
@@ -49,17 +55,31 @@ export class FakeRunStore<Payload = unknown, Ending = RunEnding>
   readonly claims = new Map<string, FakeClaim<Payload, Ending>>();
   /** Rejects this many of the next claims before they land, as a dropped connection does. */
   failNext = 0;
+  /** Lets this many of the next claims land, then rejects them, as an answer lost on the way back. */
+  loseNext = 0;
+  /** Thrown by every claim while set, as a store that refuses the request does. */
+  refusal: Error | null = null;
   heartbeatMs = 20_000;
 
   constructor(runs: Record<string, Payload> = {}) {
     this.waiting = new Map(Object.entries(runs));
   }
 
-  async claim({ runId, idempotencyKey }: ClaimRequest): Promise<FakeClaim<Payload, Ending> | null> {
+  async claim(request: ClaimRequest): Promise<FakeClaim<Payload, Ending> | null> {
+    if (this.refusal) throw this.refusal;
     if (this.failNext > 0) {
       this.failNext -= 1;
-      throw new Error("connection lost");
+      throw new StoreUnreachableError("connection lost");
     }
+    const claim = this.take(request);
+    if (this.loseNext > 0) {
+      this.loseNext -= 1;
+      throw new StoreUnreachableError("answer lost");
+    }
+    return claim;
+  }
+
+  private take({ runId, idempotencyKey }: ClaimRequest): FakeClaim<Payload, Ending> | null {
     const held = this.claims.get(runId);
     if (held) return held.idempotencyKey === idempotencyKey && !held.state.gone ? held : null;
     if (!this.waiting.has(runId)) return null;
