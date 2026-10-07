@@ -3,10 +3,10 @@
 // dispatcher and the web app depend on the contract, never on pi's own types.
 
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
-import { createEmitter as createContractEmitter, truncate } from "../contract/events.ts";
-import type { EmitRunEvent } from "../contract/events.ts";
+import { createEmitter as createContractEmitter, truncate } from "../../contract/events.ts";
+import type { EmitRunEvent } from "../../contract/events.ts";
 
-export type { EmitRunEvent, RunEvent, RunEventType } from "../contract/events.ts";
+export type { EmitRunEvent, RunEvent, RunEventType } from "../../contract/events.ts";
 
 // Events go to stdout as JSON lines. The dispatcher reads them from the
 // sandbox command stream, so the runner needs no outbound event endpoint.

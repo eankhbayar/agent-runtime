@@ -2,13 +2,15 @@
 
 Runtimes for running coding agents inside a sandbox and streaming what they do as a stable event log. One runtime today, `pi`; others sit beside it as they arrive. Extracted from the HKJC analysis runtime.
 
+Each directory below is imported by its path under `src/`, e.g. `@eankhbayar/agent-runtime/providers/docker`:
+
 ```text
-src/pi/             the pi runtime, imported as @eankhbayar/agent-runtime/pi/<part>
-  contract/         run events, the JSON-lines emitter and parser, and the fold into a view. No Node APIs, so a web app can import it.
-  runner/           runs in the sandbox: `runAgent`, the pi event adapter, the `save_output` tool
-  dispatcher/       runs on the host: `executeRun`, the `SandboxProvider` interface, the Docker provider, the reaper, gateway control
-  testing/          `FakeSandboxProvider` and `FakeSink`, to drive `executeRun` in a project's tests
-gateway/            egress gateway image, shared by every runtime: holds the provider key, proxies Anthropic-format Messages calls for valid run tokens
+src/contract/         run events, the JSON-lines emitter and parser, and the fold into a view. No Node APIs, so a web app can import it.
+src/core/             runs on the host, for every runtime: `executeRun`, `EventSink`, `RunStore`, the `SandboxProvider` interface, the reaper, `printRunEvent`
+src/providers/docker/ the Docker `SandboxProvider`, `docker stats` sampling, and gateway control (`createGateway`)
+src/pi/runner/        runs in the sandbox: `runAgent`, the pi event adapter, the `save_output` tool
+src/testing/          `FakeSandboxProvider`, `FakeSink` and `FakeRunStore`, to drive `executeRun` and a store in a project's tests
+gateway/              egress gateway image, shared by every runtime: holds the provider key, proxies Anthropic-format Messages calls for valid run tokens
 ```
 
 ## Install
@@ -16,7 +18,7 @@ gateway/            egress gateway image, shared by every runtime: holds the pro
 Releases are git tags that carry their built `dist/`:
 
 ```json
-{ "dependencies": { "@eankhbayar/agent-runtime": "github:eankhbayar/agent-runtime#v0.2.0" } }
+{ "dependencies": { "@eankhbayar/agent-runtime": "github:eankhbayar/agent-runtime#v0.3.0" } }
 ```
 
 The repo is private, so whatever installs it needs read access: locally, git's credential helper (`gh auth setup-git`); in CI, a token, for example
@@ -48,7 +50,8 @@ The sandbox image is the project's own. Node will not strip types from files und
 ## On the host
 
 ```ts
-import { createGateway, DockerSandboxProvider, executeRun, sampleUsage } from "@eankhbayar/agent-runtime/pi/dispatcher";
+import { executeRun } from "@eankhbayar/agent-runtime/core";
+import { createGateway, DockerSandboxProvider, sampleUsage } from "@eankhbayar/agent-runtime/providers/docker";
 
 const gateway = createGateway({ container: "myproject-egress-gateway" });
 await gateway.ensure({ image: "myproject-egress-gateway", llm });
@@ -102,7 +105,7 @@ Needs Docker (any context: Colima, Docker Desktop, a remote host) and a key for 
    ```ts
    import { writeFile } from "node:fs/promises";
 
-   import { LIVE, printRunEvent, type EventSink } from "@eankhbayar/agent-runtime/pi/dispatcher";
+   import { LIVE, printRunEvent, type EventSink } from "@eankhbayar/agent-runtime/core";
 
    const started = Date.now();
    const sink: EventSink = {
@@ -128,6 +131,45 @@ After taking a new tag, rebuild both images. Sandboxes kept with `keepSandbox` s
 A worked example is HKJC's `packages/analysis-runner`: `dispatcher/runtime.ts` (setup), `dispatcher/run-local.ts` (terminal CLI with isolation checks), `dispatcher/serve.ts` (a service with a Convex sink and the reaper), `scripts/stage-runtime.ts` (staging for the image build).
 
 A different sandbox platform is one more `SandboxProvider`; nothing else changes.
+
+## Stores
+
+`EventSink` is all `executeRun` writes to. A worker that claims runs itself, such as a job started for one run, uses a `RunStore`: `claim({ runId, idempotencyKey })` returns a `ClaimedRun` that is the run's sink, with the app's payload, `heartbeat()` and `finish(ending)`. `executeRun` never beats or finishes, so the caller does both; a store fails a run that goes quiet (HKJC's after 90 s):
+
+```ts
+const claim = await store.claim({ runId, idempotencyKey });
+if (claim) {
+  const stop = new AbortController();
+  const beat = setInterval(() => {
+    void claim.heartbeat().then((state) => {
+      if (state.cancelled || state.gone) stop.abort();
+    }, () => {});
+  }, claim.heartbeatMs);
+  try {
+    const { status, error, answerText, usage } = await executeRun({
+      ...options, sink: claim, runId, prompt: claim.payload.prompt, signal: stop.signal,
+    });
+    await claim.finish({ status, error, answerText, usage }); // not the whole outcome: a store's validator rejects its events
+  } catch (cause) {
+    await claim.finish({ status: "failed", error: String(cause) });
+  } finally {
+    clearInterval(beat);
+  }
+}
+```
+
+A claim rejects with `StoreUnreachableError` when no answer came back; retry that with the same key, so a claim that landed comes back. Any other rejection is the store refusing, and is not retried. An app with endings of its own (a pause for review, say), a richer answer from `finish`, or methods of its own on the claim types the store by its claim: `RunStore<MyClaim>`, where `MyClaim` extends `ClaimedRun<Payload, Ending, Settled>`. How HKJC's Convex functions and hk-legal's protocol 5 map onto it is at the top of `src/core/run-store.ts`.
+
+## Upgrading from 0.2
+
+`./pi/runner` is unchanged. The other `./pi/*` paths are gone:
+
+```text
+pi/contract     -> contract
+pi/testing      -> testing
+pi/dispatcher   -> core               executeRun, EventSink, SinkState, LIVE, TokenGrant, Mount, ArtifactUpload, RunOutcome, SandboxProvider and its types, Usage, the reaper, printRunEvent
+                -> providers/docker   docker, DockerError, DockerSandboxProvider, sampleUsage, parseDockerStats, createGateway, Gateway, LlmConfig
+```
 
 ## Develop
 
