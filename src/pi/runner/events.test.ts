@@ -1,5 +1,5 @@
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
-import type { RunEvent } from "../contract/events.ts";
+import type { RunEvent } from "../../contract/events.ts";
 import { describe, expect, it } from "vitest";
 
 import { createEmitter, forwardSessionEvent } from "./events.ts";
