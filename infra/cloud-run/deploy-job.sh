@@ -15,8 +15,8 @@ set -euo pipefail
 # Needs git, docker and gcloud. Run setup-dispatch-federation.sh first to make
 # the invoker account.
 
-usage() {
-  cat >&2 <<'USAGE'
+help() {
+  cat <<'USAGE'
 usage: deploy-job.sh --project PROJECT --region REGION --job JOB --image REPOSITORY
          --dockerfile PATH --service-account EMAIL [options]
 
@@ -28,7 +28,8 @@ usage: deploy-job.sh --project PROJECT --region REGION --job JOB --image REPOSIT
   --dockerfile       the Dockerfile to build
   --context          build context (default: the repository's root)
   --repository-root  the git repository the image is built from (default: the
-                     one holding --context)
+                     one holding the current directory); a relative
+                     --dockerfile or --context is taken from here
   --source           a path, relative to the repository root, whose uncommitted
                      changes make the tag a wip one; repeatable (default: all)
   --service-account  the identity executions run as, by email
@@ -42,14 +43,22 @@ usage: deploy-job.sh --project PROJECT --region REGION --job JOB --image REPOSIT
                      NAME (version default: latest); repeatable
   --mount-bucket     BUCKET:PATH, a Cloud Storage bucket mounted read-only at
                      PATH; repeatable
-  --cpu              default 1
-  --memory           default 512Mi
-  --task-timeout     default 3600s
+  --cpu              CPUs, e.g. 2 or 1000m (default 1)
+  --memory           e.g. 512Mi or 4Gi (default 512Mi)
+  --task-timeout     e.g. 3600s, 60m or 1h (default 3600s)
   --max-retries      default 0: the dispatcher, not Cloud Run, starts a run again
   --label            KEY=VALUE on the job; repeatable
   --commit-label     the label that records the commit (default: commit)
   --dry-run          print the docker and gcloud commands instead of running them
 USAGE
+}
+
+usage() {
+  if [[ "${1:-2}" == 0 ]]; then
+    help
+    exit 0
+  fi
+  help >&2
   exit 2
 }
 
@@ -105,7 +114,7 @@ while (($# > 0)); do
     --label) labels+=("${2:-}"); shift 2 || usage ;;
     --commit-label) commit_label="${2:-}"; shift 2 || usage ;;
     --dry-run) dry_run=true; shift ;;
-    -h | --help) usage ;;
+    -h | --help) usage 0 ;;
     *) printf 'unknown option: %s\n' "$1" >&2; usage ;;
   esac
 done
@@ -118,11 +127,14 @@ email='^[a-z0-9-]+@[a-z0-9.-]+\.gserviceaccount\.com$'
 [[ "$region" =~ ^[a-z]+-[a-z]+[0-9]+$ ]] || fail "--region is not a region: $region"
 [[ "$job" =~ ^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || fail "--job is not a job name: $job"
 [[ "$image" =~ ^[a-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)+$ ]] || fail "--image must be a repository with no tag or digest: $image"
-[[ -f "$dockerfile" ]] || fail "no Dockerfile at $dockerfile"
 [[ "$service_account" =~ $email ]] || fail "--service-account is not a service account email: $service_account"
 for invoker in ${invokers[@]+"${invokers[@]}"}; do
   [[ "$invoker" =~ $email ]] || fail "--invoker is not a service account email: $invoker"
 done
+[[ "$cpu" =~ ^([0-9]+(\.[0-9]+)?|[0-9]+m)$ ]] || fail "--cpu must be a number of CPUs or millicpus: $cpu"
+[[ "$memory" =~ ^[0-9]+(Mi|Gi)$ ]] || fail "--memory must be a size in Mi or Gi: $memory"
+[[ "$task_timeout" =~ ^[0-9]+[smh]$ ]] || fail "--task-timeout must be a duration in s, m or h: $task_timeout"
+[[ "$max_retries" =~ ^[0-9]+$ ]] || fail "--max-retries must be a whole number: $max_retries"
 [[ "$commit_label" =~ ^[a-z][a-z0-9_-]{0,62}$ ]] || fail "--commit-label is not a label key: $commit_label"
 for label in ${labels[@]+"${labels[@]}"}; do
   [[ "$label" =~ ^[a-z][a-z0-9_-]{0,62}=[a-z0-9_-]{0,63}$ ]] || fail "--label must be KEY=VALUE in lowercase: $label"
@@ -134,10 +146,15 @@ for mount in ${bucket_mounts[@]+"${bucket_mounts[@]}"}; do
   [[ "$mount" =~ ^[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]:/[^,:=]*$ ]] || fail "--mount-bucket must be BUCKET:/PATH: $mount"
 done
 
-if [[ -z "$repository_root" ]]; then
-  repository_root=$(git -C "${context:-.}" rev-parse --show-toplevel) || fail "--context is not in a git repository"
-fi
-context="${context:-$repository_root}"
+# Paths are the repository's, so a wrapper can pass them from anywhere.
+repository_root=$(git -C "${repository_root:-.}" rev-parse --show-toplevel) ||
+  fail "${repository_root:-the current directory} is not in a git repository"
+in_repository() {
+  if [[ "$1" == /* ]]; then printf '%s' "$1"; else printf '%s/%s' "$repository_root" "$1"; fi
+}
+dockerfile=$(in_repository "$dockerfile")
+context=$(in_repository "${context:-.}")
+[[ -f "$dockerfile" ]] || fail "no Dockerfile at $dockerfile"
 [[ -d "$context" ]] || fail "no build context at $context"
 
 # Values are single-quoted for YAML, so nothing in one is read as YAML. The
@@ -153,7 +170,8 @@ chmod 600 "$env_file"
 env_names=()
 write_env() {
   [[ "$1" =~ $env_name ]] || fail "not an environment variable name: $1"
-  [[ "$2" != *$'\n'* ]] || fail "the value of $1 holds a newline"
+  # A newline, carriage return or other control character would not survive the YAML.
+  [[ ! "$2" =~ [[:cntrl:]] ]] || fail "the value of $1 holds a control character"
   [[ " ${env_names[*]-} " != *" $1 "* ]] || fail "$1 is set twice"
   env_names+=("$1")
   printf '%s: %s\n' "$1" "$(yaml_value "$2")" >>"$env_file"
@@ -203,8 +221,8 @@ if $dry_run; then
   digest="$image@sha256:DIGEST"
 else
   # The image may carry digests from other repositories; take this one's.
-  digest=$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image:$tag" \
-    | grep -F "$image@sha256:" | head -n 1 || true)
+  digest=$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image:$tag" |
+    awk -v prefix="$image@sha256:" 'index($0, prefix) == 1 { print; exit }')
   [[ "$digest" == "$image@sha256:"* ]] || fail "could not resolve the pushed image's digest"
 fi
 
