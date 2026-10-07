@@ -28,7 +28,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 
-import type { EmitRunEvent } from "../contract/events.ts";
+import type { EmitRunEvent } from "../../contract/events.ts";
 import { createEmitter, forwardSessionEvent } from "./events.ts";
 
 export const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;

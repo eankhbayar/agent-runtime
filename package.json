@@ -1,7 +1,7 @@
 {
   "name": "@eankhbayar/agent-runtime",
-  "version": "0.2.0",
-  "description": "Runtimes for sandboxed coding agents. `pi`: run-event contract, in-sandbox runner, dispatcher, Docker provider and egress gateway for the pi coding agent.",
+  "version": "0.3.0",
+  "description": "Runtimes for sandboxed coding agents: the run-event contract, executeRun and the store interfaces, a Docker sandbox provider, the egress gateway, and the pi runtime's in-sandbox runner.",
   "license": "UNLICENSED",
   "private": true,
   "type": "module",
@@ -11,27 +11,31 @@
     "gateway"
   ],
   "exports": {
-    "./pi/contract": {
-      "types": "./dist/pi/contract/index.d.ts",
-      "default": "./dist/pi/contract/index.js"
+    "./contract": {
+      "types": "./dist/contract/index.d.ts",
+      "default": "./dist/contract/index.js"
+    },
+    "./core": {
+      "types": "./dist/core/index.d.ts",
+      "default": "./dist/core/index.js"
+    },
+    "./providers/docker": {
+      "types": "./dist/providers/docker/index.d.ts",
+      "default": "./dist/providers/docker/index.js"
     },
     "./pi/runner": {
       "types": "./dist/pi/runner/index.d.ts",
       "default": "./dist/pi/runner/index.js"
     },
-    "./pi/dispatcher": {
-      "types": "./dist/pi/dispatcher/index.d.ts",
-      "default": "./dist/pi/dispatcher/index.js"
-    },
-    "./pi/testing": {
-      "types": "./dist/pi/testing/index.d.ts",
-      "default": "./dist/pi/testing/index.js"
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "default": "./dist/testing/index.js"
     },
     "./package.json": "./package.json"
   },
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
-    "typecheck": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.contract.json",
     "test": "vitest run",
     "ready": "pnpm typecheck && pnpm test && pnpm build",
     "release": "node scripts/release.mjs"

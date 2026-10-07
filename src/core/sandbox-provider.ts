@@ -18,6 +18,12 @@ export type SandboxInfo = {
   createdAt: number;
 };
 
+/** A sandbox's CPU, in cores, and memory, in MiB, at one moment. */
+export type Usage = { cpu: number; memoryMb: number };
+
+/** Reads a sandbox's usage; null when it has none to give, such as when paused. */
+export type SampleUsage = (sandboxId: string) => Promise<Usage | null>;
+
 export type ExecOptions = {
   // Passed to this command only, never stored in the sandbox's configuration.
   env?: Record<string, string>;

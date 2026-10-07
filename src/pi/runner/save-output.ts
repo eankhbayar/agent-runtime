@@ -5,7 +5,7 @@ import path from "node:path";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-import type { EmitRunEvent } from "../contract/events.ts";
+import type { EmitRunEvent } from "../../contract/events.ts";
 
 /**
  * The tool an agent registers a result file with. It emits the `artifact` event
