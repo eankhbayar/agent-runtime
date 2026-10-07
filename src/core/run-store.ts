@@ -95,6 +95,21 @@ export type ClaimedRun<Payload, Ending = RunEnding, Settled = boolean> = EventSi
   finish: (ending: Ending) => Promise<Settled>;
 };
 
+// Inside a function generic over a claim, `claim.finish` takes `never`, since
+// the constraint is ClaimedRun<unknown, never, unknown>. These name the claim's
+// own types, so a harness can say what its callbacks take and return.
+
+/** What `Claim` carries as its payload. */
+export type PayloadOf<Claim> = Claim extends { payload: infer Payload } ? Payload : never;
+/** What `Claim`'s `finish` takes. */
+export type EndingOf<Claim> = Claim extends { finish: (ending: infer Ending) => unknown }
+  ? Ending
+  : never;
+/** What `Claim`'s `finish` answers with. */
+export type SettledOf<Claim> = Claim extends { finish: (ending: never) => Promise<infer Settled> }
+  ? Settled
+  : never;
+
 export interface RunStore<Claim extends ClaimedRun<unknown, never, unknown> = ClaimedRun<unknown>> {
   /**
    * Takes one run. Null when it is not there to take: gone, finished, or held
