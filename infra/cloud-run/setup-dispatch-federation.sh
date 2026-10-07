@@ -17,8 +17,8 @@ set -euo pipefail
 # Needs gcloud, openssl and Node 22.18+, and this package built (dist/ is in an
 # installed tag; run `pnpm build` in a checkout).
 
-usage() {
-  cat >&2 <<'USAGE'
+help() {
+  cat <<'USAGE'
 usage: setup-dispatch-federation.sh --project PROJECT --pool POOL --provider PROVIDER
          --issuer URL --subject SUBJECT --signing-key PATH --account NAME...
          [--read-bucket NAME=BUCKET]... [--dry-run]
@@ -35,6 +35,14 @@ usage: setup-dispatch-federation.sh --project PROJECT --pool POOL --provider PRO
   --dry-run       print the gcloud commands instead of running them; reads
                   nothing from Google and makes no key
 USAGE
+}
+
+usage() {
+  if [[ "${1:-2}" == 0 ]]; then
+    help
+    exit 0
+  fi
+  help >&2
   exit 2
 }
 
@@ -67,7 +75,7 @@ while (($# > 0)); do
     --account) accounts+=("${2:-}"); shift 2 || usage ;;
     --read-bucket) bucket_reads+=("${2:-}"); shift 2 || usage ;;
     --dry-run) dry_run=true; shift ;;
-    -h | --help) usage ;;
+    -h | --help) usage 0 ;;
     *) printf 'unknown option: %s\n' "$1" >&2; usage ;;
   esac
 done
@@ -77,7 +85,9 @@ done
 [[ "$project" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]] || fail "--project is not a project id: $project"
 [[ "$pool" =~ ^[a-z0-9-]{4,32}$ ]] || fail "--pool is not a pool id: $pool"
 [[ "$provider" =~ ^[a-z0-9-]{4,32}$ ]] || fail "--provider is not a provider id: $provider"
-[[ "$issuer" == https://* ]] || fail "--issuer must be an https URL"
+# The issuer is matched exactly against the JWT's iss, and lands in gcloud's argv.
+[[ "$issuer" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]] ||
+  fail "--issuer must be an https URL with no spaces, quotes or query: $issuer"
 # The subject lands inside a CEL string in the attribute condition.
 [[ "$subject" =~ ^[A-Za-z0-9._:-]+$ ]] || fail "--subject may hold only letters, digits and . _ : -"
 for account in "${accounts[@]}"; do
