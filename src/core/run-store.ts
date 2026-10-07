@@ -85,7 +85,12 @@ export type ClaimedRun<Payload, Ending = RunEnding, Settled = boolean> = EventSi
   payload: Payload;
   /** How often to beat so the store does not give the run to someone else. */
   heartbeatMs: number;
-  /** Keeps the claim and says whether the run is still wanted. */
+  /**
+   * Keeps the claim and says whether the run is still wanted. A store that
+   * refuses the beat because the claim is lost (hk-legal's rejected
+   * renew_lease) answers `gone`, so the work stops; reject only when no answer
+   * came back, which a harness tolerates.
+   */
   heartbeat: () => Promise<SinkState>;
   /**
    * Ends the claim and answers with what the store settled on. By default a

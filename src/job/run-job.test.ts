@@ -4,7 +4,7 @@ import { executeRun } from "../core/run.ts";
 import { StoreUnreachableError } from "../core/run-store.ts";
 import { FakeRunStore, type FakeClaim } from "../testing/fake-run-store.ts";
 import { FakeSandboxProvider, line } from "../testing/fakes.ts";
-import { runJob } from "./run-job.ts";
+import { RELEASE, runJob } from "./run-job.ts";
 
 const NO_SIGNALS = { shutdownSignals: [] };
 const QUICK = { ...NO_SIGNALS, retryDelaysMs: [1, 1, 1] };
@@ -127,6 +127,24 @@ describe("runJob", () => {
     expect(claim).toHaveBeenCalledTimes(1);
   });
 
+  it("claims nothing once it has been told to stop", async () => {
+    const store = new FakeRunStore({ run_1: {} });
+    const claim = vi.spyOn(store, "claim");
+    const work = vi.fn(async () => ({ status: "succeeded" as const }));
+
+    const result = await runJob(store, {
+      ...QUICK,
+      runId: "run_1",
+      signal: AbortSignal.abort(),
+      work,
+    });
+
+    expect(result).toEqual({ kind: "stopped", exitCode: 1 });
+    expect(claim).not.toHaveBeenCalled();
+    expect(work).not.toHaveBeenCalled();
+    expect(store.waiting.has("run_1")).toBe(true);
+  });
+
   it("stops retrying once it is told to stop", async () => {
     const store = new FakeRunStore({ run_1: {} });
     store.failNext = 10;
@@ -143,7 +161,31 @@ describe("runJob", () => {
     await vi.waitFor(() => expect(claim).toHaveBeenCalledTimes(1));
     stop.abort();
 
-    expect(await running).toMatchObject({ kind: "unclaimed", exitCode: 1 });
+    expect(await running).toEqual({ kind: "stopped", exitCode: 1 });
+    expect(claim).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry a claim after a shutdown signal that came while it was in flight", async () => {
+    const store = new FakeRunStore({ run_1: {} });
+    let answer: (() => void) | undefined;
+    const claim = vi.spyOn(store, "claim").mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          answer = () => reject(new StoreUnreachableError("connection lost"));
+        }),
+    );
+
+    const running = runJob(store, {
+      ...QUICK,
+      shutdownSignals: ["SIGUSR2"],
+      runId: "run_1",
+      work: async () => ({ status: "succeeded" }),
+    });
+    await vi.waitFor(() => expect(answer).toBeDefined());
+    process.emit("SIGUSR2", "SIGUSR2");
+    answer!();
+
+    expect(await running).toEqual({ kind: "stopped", exitCode: 1 });
     expect(claim).toHaveBeenCalledTimes(1);
   });
 
@@ -296,6 +338,155 @@ describe("runJob", () => {
       work: async () => ({ status: "succeeded" }),
     });
     expect(process.listenerCount("SIGUSR2")).toBe(before);
+  });
+
+  it("releases a run the work hands back on a shutdown, and stops beating", async () => {
+    const store = new FakeRunStore({ run_1: {} });
+    store.heartbeatMs = 2;
+
+    const running = runJob(store, {
+      ...QUICK,
+      shutdownSignals: ["SIGUSR2"],
+      runId: "run_1",
+      work: async (_claim, signal) => {
+        await aborted(signal);
+        return signal.reason === "shutdown" ? RELEASE : { status: "cancelled" };
+      },
+    });
+    await vi.waitFor(() => expect(store.claims.get("run_1")?.heartbeats).toBeGreaterThan(0));
+    process.emit("SIGUSR2", "SIGUSR2");
+
+    expect(await running).toEqual({ kind: "released", stopped: "shutdown", exitCode: 1 });
+    const claim = store.claims.get("run_1")!;
+    // Not finished: the store gives it out again once the heartbeat lapses.
+    expect(claim.ending).toBeNull();
+    expect(claim.state.gone).toBe(false);
+    const beats = claim.heartbeats;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(claim.heartbeats).toBe(beats);
+  });
+
+  it("releases a run when failed says to", async () => {
+    type Ending = { kind: "fail"; code: string };
+    const store = new FakeRunStore<unknown, Ending>({ run_1: {} });
+    const boom = new Error("aborted");
+
+    const result = await runJob(store, {
+      ...QUICK,
+      runId: "run_1",
+      signal: undefined,
+      work: async () => {
+        throw boom;
+      },
+      failed: (_error, stopped) =>
+        stopped ? RELEASE : { kind: "fail", code: "worker_attempt_unhandled" },
+    });
+    expect(result).toMatchObject({ kind: "finished", ending: { kind: "fail" } });
+
+    const stop = new AbortController();
+    store.waiting.set("run_2", {});
+    const released = await runJob(store, {
+      ...QUICK,
+      runId: "run_2",
+      signal: stop.signal,
+      work: async () => {
+        stop.abort();
+        throw boom;
+      },
+      failed: (_error, stopped) =>
+        stopped ? RELEASE : { kind: "fail", code: "worker_attempt_unhandled" },
+    });
+    expect(released).toEqual({ kind: "released", stopped: "shutdown", error: boom, exitCode: 1 });
+    expect(store.claims.get("run_2")!.ending).toBeNull();
+  });
+
+  it("waits for a beat in flight before finishing", async () => {
+    const store = new FakeRunStore({ run_1: {} });
+    store.heartbeatMs = 50;
+    const order: string[] = [];
+    const logs: string[] = [];
+    let land: (() => void) | undefined;
+    let beatStarted: () => void;
+    const started = new Promise<void>((resolve) => (beatStarted = resolve));
+
+    const running = runJob(store, {
+      ...QUICK,
+      runId: "run_1",
+      log: (m) => logs.push(m),
+      work: async (claim) => {
+        claim.heartbeat = () => {
+          order.push("beat");
+          beatStarted();
+          return new Promise((_resolve, reject) => {
+            land = () => {
+              order.push("beat failed");
+              reject(new Error("late"));
+            };
+          });
+        };
+        const finish = claim.finish;
+        claim.finish = async (ending) => {
+          order.push("finish");
+          return finish(ending);
+        };
+        await started;
+        return { status: "succeeded" };
+      },
+    });
+    await started;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(order).toEqual(["beat"]);
+    land!();
+
+    expect(await running).toMatchObject({ kind: "finished" });
+    expect(order).toEqual(["beat", "beat failed", "finish"]);
+    // Logged before the job returned, not after.
+    expect(logs).toContain("heartbeat failed: late");
+  });
+
+  it("finishes anyway once a beat in flight has taken a whole interval", async () => {
+    const store = new FakeRunStore({ run_1: {} });
+    store.heartbeatMs = 20;
+    let beatStarted: () => void;
+    const started = new Promise<void>((resolve) => (beatStarted = resolve));
+
+    const result = await runJob(store, {
+      ...QUICK,
+      runId: "run_1",
+      work: async (claim) => {
+        claim.heartbeat = () => {
+          beatStarted();
+          return new Promise(() => {});
+        };
+        await started;
+        return { status: "succeeded" };
+      },
+    });
+
+    expect(result).toMatchObject({ kind: "finished", settled: true });
+  });
+
+  it("stops the work as gone once no beat has got through for maxQuietMs", async () => {
+    const store = new FakeRunStore({ run_1: {} });
+    store.heartbeatMs = 2;
+    let reason: unknown;
+
+    const result = await runJob(store, {
+      ...QUICK,
+      runId: "run_1",
+      maxQuietMs: 10,
+      log: () => {},
+      work: async (claim, signal) => {
+        claim.heartbeat = async () => {
+          throw new StoreUnreachableError("timed out");
+        };
+        reason = await aborted(signal);
+        return RELEASE;
+      },
+    });
+
+    expect(reason).toBe("gone");
+    expect(result).toMatchObject({ kind: "released", stopped: "gone" });
   });
 
   it("reports a run it could not finish", async () => {
