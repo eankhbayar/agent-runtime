@@ -1,4 +1,4 @@
-export * from "./http.ts";
+export { CloudRunJobDispatchError, type Fetch } from "./http.ts";
 export * from "./federation.ts";
 export * from "./job.ts";
 export * from "./redispatch.ts";
