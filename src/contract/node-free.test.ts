@@ -4,7 +4,8 @@ import { describe, expect, it } from "vitest";
 
 // A web app imports the contract, so it must stay free of Node APIs. Checking
 // that it imports only its own files keeps out `node:` modules and anything
-// from the rest of the package that might pull them in.
+// from the rest of the package that might pull them in. Node's globals are
+// kept out by tsconfig.contract.json, which typechecks it without them.
 
 const dir = new URL(".", import.meta.url);
 
