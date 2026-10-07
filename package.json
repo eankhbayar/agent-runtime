@@ -27,6 +27,10 @@
       "types": "./dist/pi/runner/index.d.ts",
       "default": "./dist/pi/runner/index.js"
     },
+    "./dispatch/cloud-run": {
+      "types": "./dist/dispatch/cloud-run/index.d.ts",
+      "default": "./dist/dispatch/cloud-run/index.js"
+    },
     "./testing": {
       "types": "./dist/testing/index.d.ts",
       "default": "./dist/testing/index.js"
@@ -35,7 +39,7 @@
   },
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
-    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.contract.json",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.contract.json && tsc -p tsconfig.dispatch.json",
     "test": "vitest run",
     "ready": "pnpm typecheck && pnpm test && pnpm build",
     "release": "node scripts/release.mjs"
