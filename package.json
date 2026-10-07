@@ -1,7 +1,7 @@
 {
   "name": "@eankhbayar/agent-runtime",
-  "version": "0.2.0",
-  "description": "Runtimes for sandboxed coding agents. `pi`: run-event contract, in-sandbox runner, dispatcher, Docker provider and egress gateway for the pi coding agent.",
+  "version": "0.3.0",
+  "description": "Runtimes for sandboxed coding agents: the run-event contract, executeRun and the store interfaces, a Docker sandbox provider, the egress gateway, and the pi runtime's in-sandbox runner.",
   "license": "UNLICENSED",
   "private": true,
   "type": "module",
