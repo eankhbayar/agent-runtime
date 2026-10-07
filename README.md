@@ -137,7 +137,9 @@ A claim rejects with `StoreUnreachableError` when no answer came back; retry tha
 
 ## Jobs
 
-`runJob` from `./job` is one job execution working one run, as a Cloud Run Job started for that run does. It claims the run, retrying only `StoreUnreachableError`, with the same key, after 1, 2 and 4 s. While the work runs it beats at `claim.heartbeatMs` and aborts the work's signal when a beat says the run was cancelled or is gone; a failed beat is only logged, since the store decides when a quiet run is lost. It finishes with the ending the work returns, or, if the work throws, `failed` with the error's message (`cancelled` after a cancel). SIGTERM, which Cloud Run sends at the task timeout and on a cancelled execution, ten seconds before SIGKILL, aborts the work and the run is still finished.
+`runJob` from `./job` is one job execution working one run, as a Cloud Run Job started for that run does. It claims the run, retrying only `StoreUnreachableError`, with the same key, after 1, 2 and 4 s, and claims nothing once it has been told to stop. While the work runs it beats at `claim.heartbeatMs` and aborts the work's signal when a beat says the run was cancelled or is gone. A failed beat is only logged, since the store decides when a quiet run is lost (`maxQuietMs` stops the work sooner), so a heartbeat whose store refused it answers `gone` rather than rejecting. It finishes with the ending the work returns, or, if the work throws, with what `failed` returns: by default `failed` with the error's message, or `cancelled` after a cancel.
+
+SIGTERM, which Cloud Run sends at the task timeout and on a cancelled execution, ten seconds before SIGKILL, aborts the work with the reason `shutdown`. Finishing the run then ends it for good unless the store retries that ending, so a job whose store requeues a run when its lease lapses returns `RELEASE` from `work` or `failed` instead: the job stops beating and leaves the run to the store, as a crashed worker would.
 
 ```ts
 import { executeRun } from "@eankhbayar/agent-runtime/core";
@@ -156,7 +158,7 @@ if (result.kind === "unclaimed" || result.kind === "unfinished") console.error(S
 process.exit(result.exitCode); // so a lingering socket cannot hold the execution open
 ```
 
-The store comes first so that the work and `failed` are typed by its claim: with an ending of the app's own, the work returns it as a literal with no annotation, and `failed: (error, stopped) => ending` is required. `result.kind` is `idle` (nothing to claim), `finished` (the store has the ending, whatever it is), `unclaimed` (refused, or never answered) or `unfinished` (claimed, but the finish failed; the store reaps the run). Only the last two exit 1. The work's signal may already be aborted when the work starts; its `reason` is `cancelled`, `gone` or `shutdown`.
+The store comes first so that the work and `failed` are typed by its claim: with an ending of the app's own, the work returns it as a literal with no annotation, and `failed: (error, stopped) => ending` is required. `result.kind` is `idle` (nothing to claim) or `finished` (the store answered the finish, whatever the ending), which exit 0, or one that leaves the run to the store and exits 1: `stopped` (told to stop before claiming), `unclaimed` (refused, or never answered), `released`, or `unfinished` (the finish failed; the store reaps the run). The work's signal may already be aborted when the work starts; its `reason` is `cancelled`, `gone` or `shutdown`.
 
 ## Cloud Run
 
@@ -196,7 +198,7 @@ if (next) reserve(run, next);
 `infra/cloud-run/` sets it up. Every name is a flag; `--help` lists them and `--dry-run` prints the commands without calling Google or Docker:
 
 - `setup-dispatch-federation.sh`, once per project: the signing key, the pool and provider, and the accounts the subject may impersonate (`--account`), with bucket reads (`--read-bucket`). Give Convex the key, the provider's name and the issuer and subject it prints. It needs Node and the package's `dist/`, which a tag has.
-- `deploy-job.sh`: builds the image for linux/amd64, pushes it, deploys the job by digest and lets each `--invoker` run it with overrides. An image built from uncommitted sources is tagged `<commit>-wip-<time>`. Configuration reaches gcloud in a mode-600 file; secrets come from Secret Manager (`--secret`), and `--env-from` keeps a value out of argv.
+- `deploy-job.sh`: builds the image for linux/amd64, pushes it, deploys the job by digest and lets each `--invoker` run it with overrides. Relative paths are the repository's. An image built from uncommitted sources is tagged `<commit>-wip-<time>`. Configuration reaches gcloud in a mode-600 file; secrets come from Secret Manager (`--secret`), and `--env-from` keeps a value out of argv.
 
 ```bash
 bash node_modules/@eankhbayar/agent-runtime/infra/cloud-run/deploy-job.sh \
@@ -209,7 +211,7 @@ bash node_modules/@eankhbayar/agent-runtime/infra/cloud-run/deploy-job.sh \
 
 ## Upgrading from 0.3
 
-Nothing is renamed; `./job`, `./dispatch/cloud-run` and `infra/` are new. `executeRun` now stops a run whose signal had aborted before the runner started, where it used to run it to its time limit.
+Nothing is renamed; `./job`, `./dispatch/cloud-run` and `infra/` are new. `executeRun` with a signal that has already aborted now returns `cancelled` without building, resuming or starting anything, and one that aborts while the sandbox is being made stops the runner; before, both ran to the time limit.
 
 ## Upgrading from 0.2
 
