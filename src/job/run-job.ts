@@ -70,7 +70,7 @@ export type JobResult<Claim> =
   | { kind: "idle"; exitCode: 0 }
   /** The store refused the claim, or never answered. */
   | { kind: "unclaimed"; error: unknown; exitCode: 1 }
-  /** The store has the ending. `error` is what the work threw, if it threw. */
+  /** The store answered the finish with `settled`. `error` is what the work threw, if it did. */
   | {
       kind: "finished";
       ending: EndingOf<Claim>;
@@ -92,6 +92,7 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** `failed`'s default for a RunEnding. */
 export function defaultFailed(error: unknown, stopped: StopReason | undefined): RunEnding {
   return stopped === "cancelled"
     ? { status: "cancelled" }
