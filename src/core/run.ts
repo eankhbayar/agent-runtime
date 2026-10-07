@@ -70,6 +70,7 @@ export type TokenGrant = {
 };
 
 export type RunOutcome = {
+  /** Empty when the run was stopped before it had a sandbox and was given none to resume. */
   sandboxId: string;
   /** True when this run had to build a sandbox rather than resume one. */
   created: boolean;
@@ -193,6 +194,20 @@ export async function executeRun(opts: ExecuteRunOptions): Promise<RunOutcome> {
   const batchEvents = opts.batchEvents ?? BATCH_EVENTS;
   const retries = opts.retries ?? RETRIES;
   const retryMs = opts.retryMs ?? RETRY_MS;
+
+  // Stopped before it began, as a job shut down between its claim and its
+  // work is: nothing is built, resumed or started, and nothing is written.
+  if (opts.signal?.aborted) {
+    const { usage } = foldRunEvents([], "cancelled");
+    return {
+      sandboxId: opts.resumeSandboxId ?? "",
+      created: false,
+      status: "cancelled",
+      answerText: "",
+      usage,
+      events: [],
+    };
+  }
 
   const { sandboxId, created } = await openSandbox(opts);
   let status: FinalRunStatus = "failed";
