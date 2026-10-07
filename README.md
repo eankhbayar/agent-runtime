@@ -15,16 +15,10 @@ gateway/              egress gateway image, shared by every runtime: holds the p
 
 ## Install
 
-Releases are git tags that carry their built `dist/`:
+Releases are git tags that carry their built `dist/`. The repo is public, so installing one needs no credentials:
 
 ```json
 { "dependencies": { "@eankhbayar/agent-runtime": "github:eankhbayar/agent-runtime#v0.3.0" } }
-```
-
-The repo is private, so whatever installs it needs read access: locally, git's credential helper (`gh auth setup-git`); in CI, a token, for example
-
-```yaml
-- run: git config --global url."https://x-access-token:${{ secrets.AGENT_RUNTIME_TOKEN }}@github.com/".insteadOf "https://github.com/"
 ```
 
 `@earendil-works/pi-coding-agent` and `typebox` are peer dependencies, needed only where `./pi/runner` is imported.
@@ -45,7 +39,7 @@ await runAgent({
 
 The runner reads `PROMPT`, `RUN_ID`, `LLM_*` and `RUN_LIMITS` from its environment and writes run events to stdout as JSON lines. `--check` validates the image without calling a model.
 
-The sandbox image is the project's own. Node will not strip types from files under `node_modules`, which is why this package ships JavaScript; copy the installed package into the image's `node_modules` rather than installing it there, so the image build needs no GitHub credentials.
+The sandbox image is the project's own. Node will not strip types from files under `node_modules`, which is why this package ships JavaScript; copy the installed package into the image's `node_modules` rather than installing it there, so the image runs the version the host's lockfile pinned and its build needs no git.
 
 ## On the host
 
