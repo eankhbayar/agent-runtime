@@ -2,8 +2,8 @@
 // RESEARCH_RUN_ID, and HKJC's runs once they move to Cloud Run. The execution
 // claims the run by id, beats while the app's work runs, finishes with the
 // ending the work returns, and exits. The store owns every retry past the
-// claim: a run the job loses is given out again when its heartbeat lapses, and
-// the app's dispatcher starts another execution for it.
+// claim: a run the job loses or releases is given out again when its heartbeat
+// lapses, and the app's dispatcher starts another execution for it.
 //
 // Nothing here knows about sandboxes or pi. HKJC's `work` calls executeRun
 // with the claim as its sink; hk-legal's runs its attempt plan.
@@ -21,10 +21,21 @@ import {
 const RETRY_DELAYS_MS = [1_000, 2_000, 4_000];
 
 /**
+ * Returned by `work` or `failed` instead of an ending: leave the run unfinished
+ * and stop beating, so the store takes it back when its heartbeat lapses and
+ * gives it out again. A run stopped by a shutdown usually wants this, since
+ * the store then retries it as it would a crashed worker's; finishing it
+ * would end it for good unless the ending is one the store retries.
+ */
+export const RELEASE: unique symbol = Symbol.for("@eankhbayar/agent-runtime/job.release");
+export type Release = typeof RELEASE;
+
+/**
  * Why the work's signal was aborted: a beat said the run was cancelled, or
- * that it is gone (finished elsewhere, or given to another worker), or the
- * process is shutting down (Cloud Run sends SIGTERM at the task timeout and on
- * a cancelled execution, and SIGKILL ten seconds later).
+ * that it is gone (finished elsewhere, given to another worker, or no beat got
+ * through for `maxQuietMs`), or the process is shutting down (Cloud Run sends
+ * SIGTERM at the task timeout and on a cancelled execution, and SIGKILL ten
+ * seconds later).
  */
 export type StopReason = "cancelled" | "gone" | "shutdown";
 
@@ -33,12 +44,12 @@ export type StopReason = "cancelled" | "gone" | "shutdown";
 
 /** Works the claimed run and returns how it ended. Returns soon after `signal` aborts. */
 export type Work<Claim> = Claim extends unknown
-  ? (claim: Claim, signal: AbortSignal) => Promise<EndingOf<Claim>>
+  ? (claim: Claim, signal: AbortSignal) => Promise<EndingOf<Claim> | Release>
   : never;
 
 /** The ending for a run whose work threw. */
 export type Failed<Claim> = Claim extends unknown
-  ? (error: unknown, stopped: StopReason | undefined) => EndingOf<Claim>
+  ? (error: unknown, stopped: StopReason | undefined) => EndingOf<Claim> | Release
   : never;
 
 export type JobOptions<Claim> = {
@@ -52,6 +63,11 @@ export type JobOptions<Claim> = {
   shutdownSignals?: readonly NodeJS.Signals[];
   /** Waits between claims that got no answer. Defaults to 1 s, 2 s and 4 s. */
   retryDelaysMs?: readonly number[];
+  /**
+   * Stops the work as `gone` once no beat has got through for this long, as a
+   * store that fails or reclaims quiet runs will have done. Off by default.
+   */
+  maxQuietMs?: number;
   /** Defaults to the claim's own log once there is a claim, and to nowhere before. */
   log?: (message: string) => void;
 } & (RunEnding extends EndingOf<Claim>
@@ -64,10 +80,15 @@ export type JobOptions<Claim> = {
       failed: Failed<Claim>;
     });
 
-/** How the execution went. Exit with `exitCode`. */
+/**
+ * How the execution went. Exit with `exitCode`: 0 when there was nothing to do
+ * or the run was finished, 1 when the run was left to the store.
+ */
 export type JobResult<Claim> =
   /** The run was not there to take: gone, finished, or held under another key. */
   | { kind: "idle"; exitCode: 0 }
+  /** Told to stop before the run was claimed, so it was not. */
+  | { kind: "stopped"; exitCode: 1 }
   /** The store refused the claim, or never answered. */
   | { kind: "unclaimed"; error: unknown; exitCode: 1 }
   /** The store answered the finish with `settled`. `error` is what the work threw, if it did. */
@@ -79,6 +100,8 @@ export type JobResult<Claim> =
       error?: unknown;
       exitCode: 0;
     }
+  /** The work or `failed` returned RELEASE; the store takes the run back when its heartbeat lapses. */
+  | { kind: "released"; stopped?: StopReason; error?: unknown; exitCode: 1 }
   /** The run was claimed but not finished; the store will reap it when its heartbeat lapses. */
   | {
       kind: "unfinished";
@@ -113,21 +136,29 @@ function wait(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 /**
- * Claims `runId`, works it and finishes it. Only a claim that got no answer is
- * retried, with the same key, so one that landed comes back. Once claimed the
- * run is always finished, with the ending from `failed` when the work throws,
- * including after a shutdown; the signal the work gets may already be aborted.
+ * Claims `runId`, works it and finishes it. Nothing is claimed once the job
+ * has been told to stop. Only a claim that got no answer is retried, with the
+ * same key, so one that landed comes back. Once claimed, the run is finished
+ * with what the work returns, or what `failed` returns if it throws, unless
+ * that is RELEASE; the signal the work gets may already be aborted.
+ *
+ * A claim's heartbeat should answer `gone` when the store refuses it (the
+ * claim was lost: an expired or taken lease), not reject: a rejection reads
+ * as the store being unreachable, and the work goes on.
  */
 export async function runJob<Claim extends ClaimedRun<unknown, never, unknown>>(
   store: RunStore<Claim>,
   options: JobOptions<Claim>,
 ): Promise<JobResult<Claim>> {
   // The claim's own types, which a body generic over Claim cannot see.
-  const work = options.work as (claim: Claim, signal: AbortSignal) => Promise<EndingOf<Claim>>;
+  const work = options.work as (
+    claim: Claim,
+    signal: AbortSignal,
+  ) => Promise<EndingOf<Claim> | Release>;
   const failed = (options.failed ?? defaultFailed) as (
     error: unknown,
     stopped: StopReason | undefined,
-  ) => EndingOf<Claim>;
+  ) => EndingOf<Claim> | Release;
   // Called on the claim, for an adapter whose finish is a method.
   const finish = (claim: Claim, ending: EndingOf<Claim>) =>
     (claim.finish as (ending: EndingOf<Claim>) => Promise<SettledOf<Claim>>).call(claim, ending);
@@ -153,20 +184,17 @@ export async function runJob<Claim extends ClaimedRun<unknown, never, unknown>>(
     const delays = options.retryDelaysMs ?? RETRY_DELAYS_MS;
     let claim: Claim | null;
     for (let retry = 0; ; retry++) {
+      if (stop.signal.aborted) return { kind: "stopped", exitCode: 1 };
       try {
         claim = await store.claim({ runId: options.runId, idempotencyKey: key });
         break;
       } catch (error) {
-        if (
-          !(error instanceof StoreUnreachableError) ||
-          retry >= delays.length ||
-          stop.signal.aborted
-        ) {
+        if (!(error instanceof StoreUnreachableError) || retry >= delays.length) {
           return { kind: "unclaimed", error, exitCode: 1 };
         }
+        if (stop.signal.aborted) return { kind: "stopped", exitCode: 1 };
         log(`claim got no answer, retrying in ${delays[retry]} ms: ${message(error)}`);
         await wait(delays[retry]!, stop.signal);
-        if (stop.signal.aborted) return { kind: "unclaimed", error, exitCode: 1 };
       }
     }
     if (!claim) return { kind: "idle", exitCode: 0 };
@@ -174,27 +202,36 @@ export async function runJob<Claim extends ClaimedRun<unknown, never, unknown>>(
     log = options.log ?? ((m) => held.log(m));
 
     // A failed beat is only logged: the store decides when a quiet run is
-    // lost, and the next beat that gets through says so.
-    let beating = false;
+    // lost, and the next beat that gets through says so. One beat at a time,
+    // and the last is awaited, for up to an interval, before the run is
+    // finished or released, so a late beat does not race the store's ending.
+    let inFlight: Promise<void> | undefined;
+    let lastBeat = Date.now();
     beat = setInterval(() => {
-      if (beating) return;
-      beating = true;
-      void held
+      const quiet = Date.now() - lastBeat;
+      if (options.maxQuietMs !== undefined && quiet >= options.maxQuietMs && !stop.signal.aborted) {
+        log(`no beat got through for ${options.maxQuietMs} ms`);
+        halt("gone");
+      }
+      if (inFlight) return;
+      inFlight = held
         .heartbeat()
         .then(
           (state) => {
+            lastBeat = Date.now();
             if (state.cancelled) halt("cancelled");
             else if (state.gone) halt("gone");
           },
           (error: unknown) => log(`heartbeat failed: ${message(error)}`),
         )
         .finally(() => {
-          beating = false;
+          inFlight = undefined;
         });
     }, held.heartbeatMs);
 
-    let ending: EndingOf<Claim>;
+    let ending: EndingOf<Claim> | Release | undefined;
     let threw: { error: unknown } | undefined;
+    let unmapped: { error: unknown } | undefined;
     try {
       ending = await work(held, stop.signal);
     } catch (error) {
@@ -203,17 +240,36 @@ export async function runJob<Claim extends ClaimedRun<unknown, never, unknown>>(
       try {
         ending = failed(error, stopped);
       } catch (mapping) {
-        return { kind: "unfinished", stopped, error: mapping, exitCode: 1 };
+        unmapped = { error: mapping };
       }
     }
+    // What stopped the work, not a beat that lands after it.
+    const workStopped = stopped;
     clearInterval(beat);
+    // Bounded, so a beat that never answers cannot keep the run from ending.
+    const settle = new AbortController();
+    await Promise.race([inFlight, wait(held.heartbeatMs, settle.signal)]);
+    settle.abort();
 
+    if (unmapped) return { kind: "unfinished", stopped: workStopped, ...unmapped, exitCode: 1 };
+    if (ending === RELEASE) {
+      log("released the run to the store");
+      return { kind: "released", stopped: workStopped, ...threw, exitCode: 1 };
+    }
+    const kept = ending as EndingOf<Claim>;
     try {
-      const settled = await finish(held, ending);
-      return { kind: "finished", ending, settled, stopped, ...threw, exitCode: 0 };
+      const settled = await finish(held, kept);
+      return {
+        kind: "finished",
+        ending: kept,
+        settled,
+        stopped: workStopped,
+        ...threw,
+        exitCode: 0,
+      };
     } catch (error) {
       log(`finish failed: ${message(error)}`);
-      return { kind: "unfinished", ending, stopped, error, exitCode: 1 };
+      return { kind: "unfinished", ending: kept, stopped: workStopped, error, exitCode: 1 };
     }
   } finally {
     clearInterval(beat);
