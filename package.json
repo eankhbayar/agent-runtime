@@ -11,9 +11,9 @@
     "gateway"
   ],
   "exports": {
-    "./pi/contract": {
-      "types": "./dist/pi/contract/index.d.ts",
-      "default": "./dist/pi/contract/index.js"
+    "./contract": {
+      "types": "./dist/contract/index.d.ts",
+      "default": "./dist/contract/index.js"
     },
     "./pi/runner": {
       "types": "./dist/pi/runner/index.d.ts",

@@ -10,15 +10,15 @@ import { mkdtemp, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { createEventParser } from "../contract/events.ts";
+import { createEventParser } from "../../contract/events.ts";
 import type {
   FinalRunStatus,
   RunEvent,
   RunLimits,
   RunSample,
   RunUsage,
-} from "../contract/events.ts";
-import { answerText, foldRunEvents } from "../contract/fold.ts";
+} from "../../contract/events.ts";
+import { answerText, foldRunEvents } from "../../contract/fold.ts";
 
 import type { SandboxProvider } from "./sandbox-provider.ts";
 
