@@ -27,9 +27,9 @@
       "types": "./dist/pi/runner/index.d.ts",
       "default": "./dist/pi/runner/index.js"
     },
-    "./pi/testing": {
-      "types": "./dist/pi/testing/index.d.ts",
-      "default": "./dist/pi/testing/index.js"
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "default": "./dist/testing/index.js"
     },
     "./package.json": "./package.json"
   },
