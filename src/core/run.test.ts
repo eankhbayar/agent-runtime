@@ -4,7 +4,7 @@ import path from "node:path";
 
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { FakeSandboxProvider, FakeSink, line, type FakeRun } from "../testing/fakes.ts";
+import { FakeSandboxProvider, FakeSink, line, type FakeRun } from "../pi/testing/fakes.ts";
 import { executeRun, mediaTypeFor, type ExecuteRunOptions, type Mount } from "./run.ts";
 
 const LIMITS = { wallClockMs: 60_000, cpus: 1.5, memoryMb: 1536 };

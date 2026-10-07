@@ -17,7 +17,7 @@ import type {
   SandboxLimits,
   SandboxProvider,
   SandboxStatus,
-} from "./sandbox-provider.ts";
+} from "../../core/sandbox-provider.ts";
 
 /**
  * Reads a `{{json .Created}}` time. The plain template prints networks' times in

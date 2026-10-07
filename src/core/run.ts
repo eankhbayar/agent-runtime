@@ -10,17 +10,17 @@ import { mkdtemp, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { createEventParser } from "../../contract/events.ts";
+import { createEventParser } from "../contract/events.ts";
 import type {
   FinalRunStatus,
   RunEvent,
   RunLimits,
   RunSample,
   RunUsage,
-} from "../../contract/events.ts";
-import { answerText, foldRunEvents } from "../../contract/fold.ts";
+} from "../contract/events.ts";
+import { answerText, foldRunEvents } from "../contract/fold.ts";
 
-import type { SandboxProvider } from "./sandbox-provider.ts";
+import type { SampleUsage, SandboxProvider } from "./sandbox-provider.ts";
 
 /** How the run looks to whoever is storing it, answered on every append. */
 export type SinkState = {
@@ -104,7 +104,7 @@ export type ExecuteRunOptions = {
   /** Called once the run has a sandbox ready, resumed or newly built, before the runner starts. */
   onSandbox?: (sandboxId: string, created: boolean) => void | Promise<void>;
   /** Reads the sandbox's CPU and memory; omit to store no samples. */
-  usage?: (sandboxId: string) => Promise<{ cpu: number; memoryMb: number } | null>;
+  usage?: SampleUsage;
   /** Cancels the run from outside, e.g. when the dispatcher is shutting down. */
   signal?: AbortSignal;
   batchMs?: number;

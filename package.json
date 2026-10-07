@@ -15,13 +15,17 @@
       "types": "./dist/contract/index.d.ts",
       "default": "./dist/contract/index.js"
     },
+    "./core": {
+      "types": "./dist/core/index.d.ts",
+      "default": "./dist/core/index.js"
+    },
+    "./providers/docker": {
+      "types": "./dist/providers/docker/index.d.ts",
+      "default": "./dist/providers/docker/index.js"
+    },
     "./pi/runner": {
       "types": "./dist/pi/runner/index.d.ts",
       "default": "./dist/pi/runner/index.js"
-    },
-    "./pi/dispatcher": {
-      "types": "./dist/pi/dispatcher/index.d.ts",
-      "default": "./dist/pi/dispatcher/index.js"
     },
     "./pi/testing": {
       "types": "./dist/pi/testing/index.d.ts",

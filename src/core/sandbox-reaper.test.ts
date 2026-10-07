@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { FakeSandboxProvider } from "../testing/fakes.ts";
+import { FakeSandboxProvider } from "../pi/testing/fakes.ts";
 import {
   ORPHAN_GRACE_MS,
   planReap,

@@ -4,7 +4,7 @@
 import { createHash, randomBytes } from "node:crypto";
 
 import { docker, DockerError } from "./docker.ts";
-import type { TokenGrant } from "./run.ts";
+import type { TokenGrant } from "../../core/run.ts";
 
 // The model endpoint. The gateway proxies the Anthropic Messages format with
 // x-api-key auth and nothing else.
