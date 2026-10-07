@@ -85,7 +85,12 @@ export type ClaimedRun<Payload, Ending = RunEnding, Settled = boolean> = EventSi
   payload: Payload;
   /** How often to beat so the store does not give the run to someone else. */
   heartbeatMs: number;
-  /** Keeps the claim and says whether the run is still wanted. */
+  /**
+   * Keeps the claim and says whether the run is still wanted. A store that
+   * refuses the beat because the claim is lost (hk-legal's rejected
+   * renew_lease) answers `gone`, so the work stops; reject only when no answer
+   * came back, which a harness tolerates.
+   */
   heartbeat: () => Promise<SinkState>;
   /**
    * Ends the claim and answers with what the store settled on. By default a
@@ -94,6 +99,21 @@ export type ClaimedRun<Payload, Ending = RunEnding, Settled = boolean> = EventSi
    */
   finish: (ending: Ending) => Promise<Settled>;
 };
+
+// Inside a function generic over a claim, `claim.finish` takes `never`, since
+// the constraint is ClaimedRun<unknown, never, unknown>. These name the claim's
+// own types, so a harness can say what its callbacks take and return.
+
+/** What `Claim` carries as its payload. */
+export type PayloadOf<Claim> = Claim extends { payload: infer Payload } ? Payload : never;
+/** What `Claim`'s `finish` takes. */
+export type EndingOf<Claim> = Claim extends { finish: (ending: infer Ending) => unknown }
+  ? Ending
+  : never;
+/** What `Claim`'s `finish` answers with. */
+export type SettledOf<Claim> = Claim extends { finish: (ending: never) => Promise<infer Settled> }
+  ? Settled
+  : never;
 
 export interface RunStore<Claim extends ClaimedRun<unknown, never, unknown> = ClaimedRun<unknown>> {
   /**

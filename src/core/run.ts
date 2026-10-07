@@ -70,6 +70,7 @@ export type TokenGrant = {
 };
 
 export type RunOutcome = {
+  /** Empty when the run was stopped before it had a sandbox and was given none to resume. */
   sandboxId: string;
   /** True when this run had to build a sandbox rather than resume one. */
   created: boolean;
@@ -194,6 +195,20 @@ export async function executeRun(opts: ExecuteRunOptions): Promise<RunOutcome> {
   const retries = opts.retries ?? RETRIES;
   const retryMs = opts.retryMs ?? RETRY_MS;
 
+  // Stopped before it began, as a job shut down between its claim and its
+  // work is: nothing is built, resumed or started, and nothing is written.
+  if (opts.signal?.aborted) {
+    const { usage } = foldRunEvents([], "cancelled");
+    return {
+      sandboxId: opts.resumeSandboxId ?? "",
+      created: false,
+      status: "cancelled",
+      answerText: "",
+      usage,
+      events: [],
+    };
+  }
+
   const { sandboxId, created } = await openSandbox(opts);
   let status: FinalRunStatus = "failed";
   let error: string | undefined;
@@ -294,6 +309,8 @@ export async function executeRun(opts: ExecuteRunOptions): Promise<RunOutcome> {
       void handle.kill();
     };
     opts.signal?.addEventListener("abort", stop, { once: true });
+    // An abort while the sandbox was being made has already fired.
+    if (opts.signal?.aborted) stop();
 
     // The ticker does the work that cannot wait for the runner to write a line:
     // time-based flushes, resource samples, and noticing a cancel.

@@ -167,6 +167,40 @@ describe("executeRun", () => {
     expect(sink.sent.filter((e) => e.type === "run_finished")).toHaveLength(1);
   });
 
+  it("builds nothing for a run whose signal aborted before it began", async () => {
+    // As a job's work signal is when the shutdown came while the claim was in flight.
+    const { provider, sink, outcome } = start(
+      { ...ANSWER, chunkMs: 40 },
+      { signal: AbortSignal.abort(), resumeSandboxId: "sbx-thread" },
+    );
+    const result = await outcome;
+
+    expect(result).toMatchObject({
+      status: "cancelled",
+      sandboxId: "sbx-thread",
+      created: false,
+      events: [],
+    });
+    expect(provider.calls).toEqual([]);
+    expect(provider.execs).toEqual([]);
+    expect(sink.sent).toEqual([]);
+  });
+
+  it("stops a run whose signal aborted while its sandbox was being made", async () => {
+    const stop = new AbortController();
+    const provider = new FakeSandboxProvider({ ...ANSWER, chunkMs: 40 });
+    const create = provider.create.bind(provider);
+    provider.create = async () => {
+      stop.abort();
+      return create();
+    };
+    const { outcome } = start(ANSWER, { provider, signal: stop.signal });
+    const result = await outcome;
+
+    expect(provider.killed).toBe(true);
+    expect(result.status).toBe("cancelled");
+  });
+
   it("fails a run whose runner crashes without finishing", async () => {
     const { sink, outcome } = start({
       chunkMs: 0,
