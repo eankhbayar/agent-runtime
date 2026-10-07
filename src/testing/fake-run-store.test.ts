@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { executeRun } from "../core/run.ts";
+import { StoreUnreachableError } from "../core/run-store.ts";
 import { FakeRunStore } from "./fake-run-store.ts";
 import { FakeSandboxProvider, line } from "./fakes.ts";
 
@@ -15,14 +16,38 @@ describe("FakeRunStore", () => {
     expect(await store.claim({ runId: "run_2", idempotencyKey: "k1" })).toBeNull();
   });
 
-  it("returns a claim that landed to a retry with the same key", async () => {
+  it("drops a claim before it lands, so a retry takes the run", async () => {
     const store = new FakeRunStore({ run_1: {} });
     store.failNext = 1;
-    await expect(store.claim({ runId: "run_1", idempotencyKey: "k1" })).rejects.toThrow();
-    const first = await store.claim({ runId: "run_1", idempotencyKey: "k1" });
-    // The answer was lost on the way back, so the worker asks again.
-    const again = await store.claim({ runId: "run_1", idempotencyKey: "k1" });
-    expect(again).toBe(first);
+    await expect(store.claim({ runId: "run_1", idempotencyKey: "k1" })).rejects.toBeInstanceOf(
+      StoreUnreachableError,
+    );
+    expect(store.claims.size).toBe(0);
+    expect(await store.claim({ runId: "run_1", idempotencyKey: "k1" })).toMatchObject({
+      runId: "run_1",
+    });
+  });
+
+  it("returns a claim whose answer was lost to a retry with the same key only", async () => {
+    const store = new FakeRunStore({ run_1: {} });
+    store.loseNext = 1;
+    await expect(store.claim({ runId: "run_1", idempotencyKey: "k1" })).rejects.toBeInstanceOf(
+      StoreUnreachableError,
+    );
+    // It landed: the run is held, under the key the worker will send again.
+    const held = store.claims.get("run_1");
+    expect(held).toBeDefined();
+    expect(await store.claim({ runId: "run_1", idempotencyKey: "k1" })).toBe(held);
+    expect(await store.claim({ runId: "run_1", idempotencyKey: "k2" })).toBeNull();
+  });
+
+  it("refuses a claim with its own error, which is not one to retry", async () => {
+    const store = new FakeRunStore({ run_1: {} });
+    store.refusal = new Error("operation_rejected:corpus_release_not_ready_for_claim");
+    const refused = store.claim({ runId: "run_1", idempotencyKey: "k1" });
+    await expect(refused).rejects.toThrow("corpus_release_not_ready_for_claim");
+    await expect(refused).rejects.not.toBeInstanceOf(StoreUnreachableError);
+    expect(store.claims.size).toBe(0);
   });
 
   it("is the sink executeRun writes to, and keeps the outcome it finishes with", async () => {
@@ -47,7 +72,8 @@ describe("FakeRunStore", () => {
     });
 
     expect(claim.sent.map((e) => e.seq)).toEqual([0, 1, 2]);
-    expect(await claim.finish(outcome)).toBe(true);
+    const { status, error, answerText, usage } = outcome;
+    expect(await claim.finish({ status, error, answerText, usage })).toBe(true);
     expect(claim.ending).toMatchObject({ status: "succeeded", answerText: "52." });
     // Finished, the run is gone to its writer, and no one can claim it again.
     expect(await claim.events([])).toMatchObject({ gone: true });
