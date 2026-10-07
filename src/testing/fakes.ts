@@ -1,10 +1,10 @@
-// Test doubles for the dispatcher: a sandbox whose runner is a script of stdout
+// Test doubles for executeRun: a sandbox whose runner is a script of stdout
 // lines, and a sink that records what a run would have written.
 
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 
-import type { RunEvent, RunSample } from "../../contract/events.ts";
+import type { RunEvent, RunSample } from "../contract/events.ts";
 
 import type {
   ExecHandle,
@@ -12,8 +12,8 @@ import type {
   SandboxInfo,
   SandboxProvider,
   SandboxStatus,
-} from "../../core/sandbox-provider.ts";
-import type { ArtifactUpload, EventSink, SinkState } from "../../core/run.ts";
+} from "../core/sandbox-provider.ts";
+import type { ArtifactUpload, EventSink, SinkState } from "../core/run.ts";
 
 export type FakeRun = {
   /** What the runner writes to stdout, one chunk at a time. */
