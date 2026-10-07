@@ -1,7 +1,7 @@
 // Renders the runner's run events in a terminal. The dispatcher's stdout sink
 // prints each batch it would otherwise have stored.
 
-import type { RunEvent } from "../../contract/events.ts";
+import type { RunEvent } from "../contract/events.ts";
 
 export function printRunEvent(event: RunEvent, elapsed: () => string): void {
   const p = event.payload;

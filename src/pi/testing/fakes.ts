@@ -12,8 +12,8 @@ import type {
   SandboxInfo,
   SandboxProvider,
   SandboxStatus,
-} from "../dispatcher/sandbox-provider.ts";
-import type { ArtifactUpload, EventSink, SinkState } from "../dispatcher/run.ts";
+} from "../../core/sandbox-provider.ts";
+import type { ArtifactUpload, EventSink, SinkState } from "../../core/run.ts";
 
 export type FakeRun = {
   /** What the runner writes to stdout, one chunk at a time. */

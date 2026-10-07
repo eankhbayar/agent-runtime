@@ -1,9 +1,9 @@
 // One `docker stats` reading per sandbox, for the resource samples the trace
 // view draws against the run's limits.
 
-import { docker } from "./docker.ts";
+import type { Usage } from "../../core/sandbox-provider.ts";
 
-export type Usage = { cpu: number; memoryMb: number };
+import { docker } from "./docker.ts";
 
 // Docker reports memory in binary units; a sandbox's limit is set in MiB too,
 // so MiB is taken as the unit of memoryMb and the rest scale to it.
