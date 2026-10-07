@@ -294,6 +294,8 @@ export async function executeRun(opts: ExecuteRunOptions): Promise<RunOutcome> {
       void handle.kill();
     };
     opts.signal?.addEventListener("abort", stop, { once: true });
+    // An abort while the sandbox was being made has already fired.
+    if (opts.signal?.aborted) stop();
 
     // The ticker does the work that cannot wait for the runner to write a line:
     // time-based flushes, resource samples, and noticing a cancel.

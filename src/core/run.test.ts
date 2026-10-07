@@ -167,6 +167,18 @@ describe("executeRun", () => {
     expect(sink.sent.filter((e) => e.type === "run_finished")).toHaveLength(1);
   });
 
+  it("stops a run whose signal aborted before the runner started", async () => {
+    // As a job's work signal is when the shutdown came while the claim was in flight.
+    const { provider, outcome } = start(
+      { ...ANSWER, chunkMs: 40 },
+      { signal: AbortSignal.abort() },
+    );
+    const result = await outcome;
+
+    expect(provider.killed).toBe(true);
+    expect(result.status).toBe("cancelled");
+  });
+
   it("fails a run whose runner crashes without finishing", async () => {
     const { sink, outcome } = start({
       chunkMs: 0,
