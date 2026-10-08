@@ -1,19 +1,21 @@
 // Test doubles for executeRun: a sandbox whose runner is a script of stdout
 // lines, and a sink that records what a run would have written.
 
-import { writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import type { RunEvent, RunSample } from "../contract/events.ts";
 
 import type {
+  BindMount,
   ExecHandle,
   ExecOptions,
   SandboxInfo,
+  SandboxLimits,
   SandboxProvider,
   SandboxStatus,
 } from "../core/sandbox-provider.ts";
-import type { ArtifactUpload, EventSink, SinkState } from "../core/run.ts";
+import { SESSION_RESTORE_SCRIPT, type ArtifactUpload, type EventSink, type SinkState } from "../core/run.ts";
 
 export type FakeRun = {
   /** What the runner writes to stdout, one chunk at a time. */
@@ -22,9 +24,29 @@ export type FakeRun = {
   exitCode?: number;
   /** Milliseconds between chunks, so a cancel can land mid-run. */
   chunkMs?: number;
-  /** Files the sandbox holds, by the path an artifact event points at. */
+  /** Files the sandbox holds, by path: what an artifact event points at, or a session the runner wrote. */
   files?: Record<string, string>;
 };
+
+/** What `create` was asked for. */
+export type FakeCreate = {
+  image: string;
+  limits: SandboxLimits;
+  labels?: Record<string, string>;
+  binds?: BindMount[];
+};
+
+/** Every file under a local directory, by its path relative to it. */
+async function walk(dir: string, prefix = ""): Promise<[string, Buffer][]> {
+  const out: [string, Buffer][] = [];
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    const relative = path.posix.join(prefix, entry.name);
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...(await walk(full, relative)));
+    else out.push([relative, await readFile(full)]);
+  }
+  return out;
+}
 
 export class FakeSandboxProvider implements SandboxProvider {
   readonly calls: string[] = [];
@@ -36,35 +58,71 @@ export class FakeSandboxProvider implements SandboxProvider {
   /** What `list` reports, for the reaper tests. */
   sandboxes: SandboxInfo[] = [];
   readonly destroyed: string[] = [];
+  /** The options of every `create`. */
+  readonly creates: FakeCreate[] = [];
+  /**
+   * The sandbox's files by path: `files` from the run, what `upload` copied
+   * in, and a restored session. `download` copies from here.
+   */
+  readonly fs: Map<string, Buffer>;
+  /** Makes the session restore command exit 1. */
+  restoreFails = false;
   private state: SandboxStatus = "running";
   private next = 0;
   private readonly run: FakeRun;
 
   constructor(run: FakeRun = { stdout: [] }) {
     this.run = run;
+    this.fs = new Map(Object.entries(run.files ?? {}).map(([p, body]) => [p, Buffer.from(body)]));
   }
 
-  async create(): Promise<string> {
+  async create(opts?: FakeCreate): Promise<string> {
     this.calls.push("create");
+    if (opts) this.creates.push(opts);
     this.state = "running";
     return `sbx-${++this.next}`;
   }
 
-  async upload(): Promise<void> {
+  async upload(_sandboxId: string, localDir: string, remoteDir: string): Promise<void> {
     this.calls.push("upload");
+    for (const [relative, body] of await walk(localDir)) {
+      this.fs.set(path.posix.join(remoteDir, relative), body);
+    }
   }
 
+  /** Copies a file, or a directory with everything under it, as `docker cp` does. */
   async download(_sandboxId: string, remotePath: string, localPath: string): Promise<void> {
     this.calls.push(`download ${remotePath}`);
-    const body = this.run.files?.[remotePath];
-    if (body === undefined) throw new Error(`No such file: ${remotePath}`);
-    await writeFile(path.join(localPath, path.posix.basename(remotePath)), body);
+    const target = path.join(localPath, path.posix.basename(remotePath));
+    const file = this.fs.get(remotePath);
+    if (file !== undefined) {
+      await writeFile(target, file);
+      return;
+    }
+    const under = [...this.fs].filter(([p]) => p.startsWith(`${remotePath}/`));
+    if (under.length === 0) throw new Error(`No such file: ${remotePath}`);
+    for (const [p, body] of under) {
+      const local = path.join(target, path.posix.relative(remotePath, p));
+      await mkdir(path.dirname(local), { recursive: true });
+      await writeFile(local, body);
+    }
   }
 
   exec(_sandboxId: string, command: string[], opts: ExecOptions = {}): ExecHandle {
     this.execs.push(command);
     if (command[0] === "sha256sum") {
       opts.onStdout?.(`${this.uploadSha}  ${command[1]}\n`);
+      return { done: Promise.resolve(0), kill: async () => {} };
+    }
+    // executeRun moving a restored session from where it was uploaded into place.
+    if (command[2] === SESSION_RESTORE_SCRIPT) {
+      const [staged, sessionDir] = command.slice(4) as [string, string];
+      if (this.restoreFails) return { done: Promise.resolve(1), kill: async () => {} };
+      for (const [p, body] of [...this.fs]) {
+        if (!p.startsWith(`${staged}/`)) continue;
+        this.fs.delete(p);
+        this.fs.set(path.posix.join(sessionDir, path.posix.relative(staged, p)), body);
+      }
       return { done: Promise.resolve(0), kill: async () => {} };
     }
     let stopped = false;

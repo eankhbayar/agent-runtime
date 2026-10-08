@@ -5,8 +5,8 @@
 //
 // This file never calls docker, a store or the gateway directly.
 
-import { createHash } from "node:crypto";
-import { mkdtemp, readFile, stat } from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -20,7 +20,8 @@ import type {
 } from "../contract/events.ts";
 import { answerText, foldRunEvents } from "../contract/fold.ts";
 
-import type { SampleUsage, SandboxProvider } from "./sandbox-provider.ts";
+import type { BindMount, SampleUsage, SandboxProvider } from "./sandbox-provider.ts";
+import type { SessionStore } from "./session-store.ts";
 
 /** How the run looks to whoever is storing it, answered on every append. */
 export type SinkState = {
@@ -52,6 +53,21 @@ export type Mount = {
   remoteDir: string;
   /** Files to hash once uploaded: path inside `remoteDir` -> expected sha256. */
   verify?: Record<string, string>;
+  /**
+   * Bind `localDir` read-only into the sandbox when it is created instead of
+   * copying it, e.g. a Cloud Storage volume the job mounted. Needs a provider
+   * that binds directories (Cloud Run); `verify` still hashes the files.
+   */
+  mounted?: boolean;
+};
+
+/** Where executeRun keeps the runner's session between sandboxes. */
+export type SessionOptions = {
+  store: SessionStore;
+  /** Usually the thread's id. */
+  key: string;
+  /** The session directory in the sandbox. Default `/workspace/.sessions`, where the pi runner keeps it. */
+  remoteDir?: string;
 };
 
 export type EventSink = {
@@ -83,6 +99,11 @@ export type RunOutcome = {
   /** Tokens and cost summed over every turn. */
   usage: RunUsage;
   events: RunEvent[];
+  /**
+   * With `session`: whether a stored session was put in the sandbox, and
+   * whether the session was stored again once the runner exited.
+   */
+  session?: { restored: boolean; saved: boolean };
 };
 
 export type ExecuteRunOptions = {
@@ -105,6 +126,13 @@ export type ExecuteRunOptions = {
   resumeSandboxId?: string;
   /** Pause the sandbox instead of destroying it, so the thread can reuse it. */
   keepSandbox?: boolean;
+  /**
+   * Restores the session into a sandbox this run builds, before the runner
+   * starts, and saves it once the runner has exited, however the run ended.
+   * For a provider that cannot pause, such as Cloud Run; a resumed sandbox
+   * still has its session and is not restored into.
+   */
+  session?: SessionOptions;
   /** Called once the run has a sandbox ready, resumed or newly built, before the runner starts. */
   onSandbox?: (sandboxId: string, created: boolean) => void | Promise<void>;
   /** Reads the sandbox's CPU and memory; omit to store no samples. */
@@ -177,7 +205,8 @@ async function uploadMount(
   sandboxId: string,
   mount: Mount,
 ): Promise<void> {
-  await provider.upload(sandboxId, mount.localDir, mount.remoteDir);
+  // A mounted directory is already there, bound when the sandbox was created.
+  if (!mount.mounted) await provider.upload(sandboxId, mount.localDir, mount.remoteDir);
   for (const [file, expected] of Object.entries(mount.verify ?? {})) {
     const remotePath = path.posix.join(mount.remoteDir, file);
     let sum = "";
@@ -188,6 +217,71 @@ async function uploadMount(
     if (sum.trim().split(" ")[0] !== expected) {
       throw new Error(`${remotePath} did not upload intact`);
     }
+  }
+}
+
+export const SESSION_DIR = "/workspace/.sessions";
+
+/**
+ * Run in the sandbox as the runner's user, so the restored files are the
+ * runner's to append to: `sh -c SESSION_RESTORE_SCRIPT sh <staged> <sessionDir>`.
+ */
+export const SESSION_RESTORE_SCRIPT =
+  'mkdir -p "$2" && cp -R "$1"/. "$2"/; code=$?; rm -rf "$1" 2>/dev/null; exit $code';
+
+/** Copies the stored session into a new sandbox; false when there is none yet. */
+async function restoreSession(
+  provider: SandboxProvider,
+  sandboxId: string,
+  session: SessionOptions,
+): Promise<boolean> {
+  const local = await mkdtemp(path.join(tmpdir(), "agent-runtime-session-"));
+  try {
+    if (!(await session.store.restore(session.key, local))) return false;
+    const staged = `/tmp/agent-runtime-session-${randomBytes(6).toString("hex")}`;
+    await provider.upload(sandboxId, local, staged);
+    let stderr = "";
+    const code = await provider.exec(
+      sandboxId,
+      ["sh", "-c", SESSION_RESTORE_SCRIPT, "sh", staged, session.remoteDir ?? SESSION_DIR],
+      { timeoutMs: 60_000, onStderr: (d) => (stderr += d) },
+    ).done;
+    if (code !== 0) throw new Error(`Restoring the session exited ${code}: ${stderr.trim()}`);
+    return true;
+  } finally {
+    await rm(local, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/** Stores the sandbox's session; false, and logged, when there was none or it failed. */
+async function saveSession(
+  provider: SandboxProvider,
+  sandboxId: string,
+  session: SessionOptions,
+  log: (message: string) => void,
+): Promise<boolean> {
+  const remoteDir = session.remoteDir ?? SESSION_DIR;
+  const local = await mkdtemp(path.join(tmpdir(), "agent-runtime-session-"));
+  try {
+    try {
+      await provider.download(sandboxId, remoteDir, local);
+    } catch (cause) {
+      // A runner that failed before pi started has written no session; the stored one stays.
+      log(`no session to save at ${remoteDir}: ${String(cause)}`);
+      return false;
+    }
+    const dir = path.join(local, path.posix.basename(remoteDir));
+    if (!(await stat(dir).catch(() => null))?.isDirectory()) {
+      log(`no session to save at ${remoteDir}`);
+      return false;
+    }
+    await session.store.save(session.key, dir);
+    return true;
+  } catch (cause) {
+    log(`could not save the session: ${String(cause)}`);
+    return false;
+  } finally {
+    await rm(local, { recursive: true, force: true }).catch(() => {});
   }
 }
 
@@ -212,9 +306,10 @@ export async function executeRun(opts: ExecuteRunOptions): Promise<RunOutcome> {
     };
   }
 
-  const { sandboxId, created } = await openSandbox(opts);
+  const { sandboxId, created, restored } = await openSandbox(opts);
   let status: FinalRunStatus = "failed";
   let error: string | undefined;
+  let saved = false;
   const log: RunEvent[] = [];
 
   try {
@@ -359,6 +454,8 @@ export async function executeRun(opts: ExecuteRunOptions): Promise<RunOutcome> {
       await sampler.stop();
       opts.signal?.removeEventListener("abort", stop);
       await tokens.revoke(token).catch(() => {});
+      // The runner has exited, whether it finished, failed, timed out or was stopped.
+      if (opts.session) saved = await saveSession(provider, sandboxId, opts.session, sink.log);
     }
   } finally {
     if (opts.keepSandbox) await provider.pause(sandboxId).catch(() => {});
@@ -374,19 +471,20 @@ export async function executeRun(opts: ExecuteRunOptions): Promise<RunOutcome> {
     answerText: answerText(view),
     usage: view.usage,
     events: log,
+    ...(opts.session ? { session: { restored, saved } } : {}),
   };
 }
 
 /** Continues the thread's sandbox when it is still there, or builds a new one. */
 async function openSandbox(
   opts: ExecuteRunOptions,
-): Promise<{ sandboxId: string; created: boolean }> {
+): Promise<{ sandboxId: string; created: boolean; restored: boolean }> {
   const { provider, sink } = opts;
   if (opts.resumeSandboxId) {
     try {
       await provider.resume(opts.resumeSandboxId);
       sink.log(`resumed sandbox ${opts.resumeSandboxId}`);
-      return { sandboxId: opts.resumeSandboxId, created: false };
+      return { sandboxId: opts.resumeSandboxId, created: false, restored: false };
     } catch (cause) {
       sink.log(`sandbox ${opts.resumeSandboxId} could not be resumed: ${String(cause)}`);
     }
@@ -395,19 +493,30 @@ async function openSandbox(
   // have must not cost a container.
   const mounts = opts.mounts ?? [];
   await checkMounts(mounts);
+  const binds: BindMount[] = mounts
+    .filter((mount) => mount.mounted)
+    .map(({ localDir, remoteDir }) => ({ localDir, remoteDir }));
   const sandboxId = await provider.create({
     image: opts.image,
     limits: { cpus: opts.limits.cpus, memoryMb: opts.limits.memoryMb, pids: 512 },
     labels: opts.labels,
+    ...(binds.length > 0 ? { binds } : {}),
   });
+  let restored = false;
   try {
     for (const mount of mounts) await uploadMount(provider, sandboxId, mount);
     sink.log(`created sandbox ${sandboxId}`);
+    // A store that cannot be read fails the run here rather than letting it
+    // start over and then save the shorter session over the thread's.
+    if (opts.session) {
+      restored = await restoreSession(provider, sandboxId, opts.session);
+      sink.log(restored ? `restored session ${opts.session.key}` : `no session yet for ${opts.session.key}`);
+    }
   } catch (cause) {
     await provider.destroy(sandboxId).catch(() => {});
     throw cause;
   }
-  return { sandboxId, created: true };
+  return { sandboxId, created: true, restored };
 }
 
 /** Copies one output out of the sandbox, stores it, and returns its id. */

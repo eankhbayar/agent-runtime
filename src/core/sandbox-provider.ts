@@ -39,12 +39,22 @@ export type ExecHandle = {
   kill: () => Promise<void>;
 };
 
+/**
+ * A directory on the provider's host made visible, read-only, at `remoteDir`
+ * from the moment the sandbox starts, rather than copied in: a Cloud Run job's
+ * Cloud Storage volume, say. Only a provider that can bind directories takes
+ * one; the Docker provider refuses it.
+ */
+export type BindMount = { localDir: string; remoteDir: string };
+
 export interface SandboxProvider {
   // Creates and starts a sandbox whose only reachable host is the egress gateway.
   create(opts: {
     image: string;
     limits: SandboxLimits;
     labels?: Record<string, string>;
+    /** Present only when the run has `mounted` mounts. */
+    binds?: BindMount[];
   }): Promise<string>;
   // Copies a local directory's contents into the sandbox, owned by root and
   // read-only to the command user.

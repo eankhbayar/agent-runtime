@@ -11,6 +11,7 @@ import { randomBytes } from "node:crypto";
 
 import { docker, DockerError } from "./docker.ts";
 import type {
+  BindMount,
   ExecHandle,
   ExecOptions,
   SandboxInfo,
@@ -75,11 +76,19 @@ export class DockerSandboxProvider implements SandboxProvider {
     image,
     limits,
     labels = {},
+    binds,
   }: {
     image: string;
     limits: SandboxLimits;
     labels?: Record<string, string>;
+    binds?: BindMount[];
   }): Promise<string> {
+    // Docker's directories live on the Docker host, not here, so mounts are copied in.
+    if (binds?.length) {
+      throw new Error(
+        `DockerSandboxProvider copies mounts in; ${binds[0]!.localDir} is \`mounted\`, which needs a provider that binds directories`,
+      );
+    }
     const id = `${this.opts.namespace}-sbx-${randomBytes(6).toString("hex")}`;
     const labelArgs = Object.entries({
       [`${this.opts.namespace}.sandbox`]: "1",
