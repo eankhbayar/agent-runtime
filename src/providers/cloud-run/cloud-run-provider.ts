@@ -156,7 +156,8 @@ export function exposedMounts(table: string, covered: readonly string[]): string
   return table
     .split("\n")
     .map((line) => line.split(" "))
-    .filter(([, , type]) => type?.startsWith("fuse"))
+    // fuse or fuse.<name> (gcsfuse); not fusectl, the control filesystem.
+    .filter(([, , type]) => type === "fuse" || type?.startsWith("fuse."))
     .map(([, point]) =>
       point!.replace(/\\([0-7]{3})/g, (_, code: string) => String.fromCharCode(Number.parseInt(code, 8))),
     )

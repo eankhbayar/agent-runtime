@@ -329,6 +329,7 @@ describe("CloudRunSandboxProvider, guarding the job", { timeout: 30_000 }, () =>
       "agent-sessions /sessions fuse rw,nosuid 0 0",
       "agent-data /snap\\040shots fuse.gcsfuse ro 0 0",
       "proc /proc proc rw 0 0",
+      "fusectl /sys/fs/fuse/connections fusectl rw 0 0",
     ].join("\n");
     expect(exposedMounts(table, [])).toEqual(["/sessions", "/snap shots"]);
     expect(exposedMounts(table, ["/sessions", "/snap shots"])).toEqual([]);
