@@ -70,8 +70,11 @@ export type TokenGrant = {
 };
 
 export type RunOutcome = {
-  /** Empty when the run was stopped before it had a sandbox and was given none to resume. */
-  sandboxId: string;
+  /**
+   * The run's sandbox. Null when the run was stopped before it began and was
+   * given none to resume, so there is nothing to record or ask a provider about.
+   */
+  sandboxId: string | null;
   /** True when this run had to build a sandbox rather than resume one. */
   created: boolean;
   status: FinalRunStatus;
@@ -200,7 +203,7 @@ export async function executeRun(opts: ExecuteRunOptions): Promise<RunOutcome> {
   if (opts.signal?.aborted) {
     const { usage } = foldRunEvents([], "cancelled");
     return {
-      sandboxId: opts.resumeSandboxId ?? "",
+      sandboxId: opts.resumeSandboxId || null,
       created: false,
       status: "cancelled",
       answerText: "",
