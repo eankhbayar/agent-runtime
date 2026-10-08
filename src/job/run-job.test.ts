@@ -466,6 +466,72 @@ describe("runJob", () => {
     expect(result).toMatchObject({ kind: "finished", settled: true });
   });
 
+  it("waits only briefly for a beat in flight once shut down", async () => {
+    vi.useFakeTimers();
+    const store = new FakeRunStore({ run_1: {} });
+    // HKJC's interval, twice Cloud Run's grace before SIGKILL.
+    store.heartbeatMs = 20_000;
+    let beatStarted = false;
+    let returned = false;
+
+    const running = runJob(store, {
+      ...QUICK,
+      shutdownSignals: ["SIGUSR2"],
+      runId: "run_1",
+      work: async (claim, signal) => {
+        claim.heartbeat = () => {
+          beatStarted = true;
+          return new Promise(() => {});
+        };
+        await aborted(signal);
+        return { status: "cancelled" };
+      },
+    }).finally(() => (returned = true));
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(beatStarted).toBe(true);
+    process.emit("SIGUSR2", "SIGUSR2");
+
+    await vi.advanceTimersByTimeAsync(999);
+    expect(returned).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(returned).toBe(true);
+    expect(await running).toMatchObject({ kind: "finished", stopped: "shutdown", settled: true });
+  });
+
+  it("cuts the wait for a beat in flight short when a shutdown comes during it", async () => {
+    vi.useFakeTimers();
+    const store = new FakeRunStore({ run_1: {} });
+    store.heartbeatMs = 20_000;
+    let returned = false;
+    let beatStarted: () => void;
+    const started = new Promise<void>((resolve) => (beatStarted = resolve));
+
+    const running = runJob(store, {
+      ...QUICK,
+      shutdownSignals: ["SIGUSR2"],
+      shutdownBeatWaitMs: 500,
+      runId: "run_1",
+      work: async (claim) => {
+        claim.heartbeat = () => {
+          beatStarted();
+          return new Promise(() => {});
+        };
+        await started;
+        return { status: "succeeded" };
+      },
+    }).finally(() => (returned = true));
+    await vi.advanceTimersByTimeAsync(25_000);
+    expect(returned).toBe(false);
+    process.emit("SIGUSR2", "SIGUSR2");
+
+    await vi.advanceTimersByTimeAsync(500);
+    expect(returned).toBe(true);
+    // The work had already ended, so the shutdown did not stop it.
+    const result = await running;
+    expect(result).toMatchObject({ kind: "finished", ending: { status: "succeeded" } });
+    expect(result.kind === "finished" && result.stopped).toBeUndefined();
+  });
+
   it("stops the work as gone once no beat has got through for maxQuietMs", async () => {
     const store = new FakeRunStore({ run_1: {} });
     store.heartbeatMs = 2;
@@ -487,6 +553,66 @@ describe("runJob", () => {
 
     expect(reason).toBe("gone");
     expect(result).toMatchObject({ kind: "released", stopped: "gone" });
+  });
+
+  it("does not stop a healthy run whose maxQuietMs is no more than its heartbeat", async () => {
+    vi.useFakeTimers();
+    const store = new FakeRunStore({ run_1: {} });
+    store.heartbeatMs = 5_000;
+    const logs: string[] = [];
+    let signal: AbortSignal | undefined;
+    let done: () => void;
+    const finished = new Promise<void>((resolve) => (done = resolve));
+
+    const running = runJob(store, {
+      ...QUICK,
+      runId: "run_1",
+      maxQuietMs: 5_000,
+      log: (m) => logs.push(m),
+      work: async (_claim, workSignal) => {
+        signal = workSignal;
+        await finished;
+        return { status: "succeeded" };
+      },
+    });
+    // The first tick comes an interval after the claim, before any beat.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(store.claims.get("run_1")!.heartbeats).toBe(6);
+    expect(signal!.aborted).toBe(false);
+    done!();
+
+    const result = await running;
+    expect(result).toMatchObject({ kind: "finished", ending: { status: "succeeded" } });
+    expect(result.kind === "finished" && result.stopped).toBeUndefined();
+    expect(logs).toContain("maxQuietMs 5000 is under two beats; using 10000 ms");
+  });
+
+  it("stops a quiet run only once a beat had a whole interval to get through", async () => {
+    vi.useFakeTimers();
+    const store = new FakeRunStore({ run_1: {} });
+    store.heartbeatMs = 5_000;
+    let signal: AbortSignal | undefined;
+
+    const running = runJob(store, {
+      ...QUICK,
+      runId: "run_1",
+      maxQuietMs: 1,
+      log: () => {},
+      work: async (claim, workSignal) => {
+        signal = workSignal;
+        claim.heartbeat = async () => {
+          throw new StoreUnreachableError("timed out");
+        };
+        await aborted(workSignal);
+        return RELEASE;
+      },
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(signal!.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(signal!.reason).toBe("gone");
+
+    expect(await running).toMatchObject({ kind: "released", stopped: "gone" });
   });
 
   it("reports a run it could not finish", async () => {

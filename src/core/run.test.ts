@@ -186,6 +186,16 @@ describe("executeRun", () => {
     expect(sink.sent).toEqual([]);
   });
 
+  it("has no sandbox for a run stopped before it began with none to resume", async () => {
+    const { provider, outcome } = start(ANSWER, { signal: AbortSignal.abort() });
+    const result = await outcome;
+
+    expect(result).toMatchObject({ status: "cancelled", created: false, events: [] });
+    // Null, not an empty id a caller could hand to a provider.
+    expect(result.sandboxId).toBeNull();
+    expect(provider.calls).toEqual([]);
+  });
+
   it("stops a run whose signal aborted while its sandbox was being made", async () => {
     const stop = new AbortController();
     const provider = new FakeSandboxProvider({ ...ANSWER, chunkMs: 40 });

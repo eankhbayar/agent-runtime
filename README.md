@@ -21,7 +21,7 @@ infra/cloud-run/        scripts that set up Convex's federation and deploy a Clo
 Releases are git tags that carry their built `dist/`. The repo is public, so installing one needs no credentials:
 
 ```json
-{ "dependencies": { "@eankhbayar/agent-runtime": "github:eankhbayar/agent-runtime#v0.4.0" } }
+{ "dependencies": { "@eankhbayar/agent-runtime": "github:eankhbayar/agent-runtime#v0.5.0" } }
 ```
 
 `@earendil-works/pi-coding-agent` and `typebox` are peer dependencies, needed only where `./pi/runner` is imported.
@@ -137,9 +137,9 @@ A claim rejects with `StoreUnreachableError` when no answer came back; retry tha
 
 ## Jobs
 
-`runJob` from `./job` is one job execution working one run, as a Cloud Run Job started for that run does. It claims the run, retrying only `StoreUnreachableError`, with the same key, after 1, 2 and 4 s, and claims nothing once it has been told to stop. While the work runs it beats at `claim.heartbeatMs` and aborts the work's signal when a beat says the run was cancelled or is gone. A failed beat is only logged, since the store decides when a quiet run is lost (`maxQuietMs` stops the work sooner), so a heartbeat whose store refused it answers `gone` rather than rejecting. It finishes with the ending the work returns, or, if the work throws, with what `failed` returns: by default `failed` with the error's message, or `cancelled` after a cancel.
+`runJob` from `./job` is one job execution working one run, as a Cloud Run Job started for that run does. It claims the run, retrying only `StoreUnreachableError`, with the same key, after 1, 2 and 4 s, and claims nothing once it has been told to stop. While the work runs it beats at `claim.heartbeatMs` and aborts the work's signal when a beat says the run was cancelled or is gone. A failed beat is only logged, since the store decides when a quiet run is lost (`maxQuietMs` stops the work sooner, and is raised to twice `claim.heartbeatMs` if less, since quiet time counts from the claim), so a heartbeat whose store refused it answers `gone` rather than rejecting. It finishes with the ending the work returns, or, if the work throws, with what `failed` returns: by default `failed` with the error's message, or `cancelled` after a cancel.
 
-SIGTERM, which Cloud Run sends at the task timeout and on a cancelled execution, ten seconds before SIGKILL, aborts the work with the reason `shutdown`. Finishing the run then ends it for good unless the store retries that ending, so a job whose store requeues a run when its lease lapses returns `RELEASE` from `work` or `failed` instead: the job stops beating and leaves the run to the store, as a crashed worker would.
+SIGTERM, which Cloud Run sends at the task timeout and on a cancelled execution, ten seconds before SIGKILL, aborts the work with the reason `shutdown`. Finishing the run then ends it for good unless the store retries that ending, so a job whose store requeues a run when its lease lapses returns `RELEASE` from `work` or `failed` instead: the job stops beating and leaves the run to the store, as a crashed worker would. Before finishing, the job waits for a beat in flight for up to one interval, but once it is shutting down for only `shutdownBeatWaitMs` (1 s by default), so the finish goes out before SIGKILL.
 
 ```ts
 import { executeRun } from "@eankhbayar/agent-runtime/core";
@@ -208,6 +208,12 @@ bash node_modules/@eankhbayar/agent-runtime/infra/cloud-run/deploy-job.sh \
   --invoker myapp-job-invoker@myproject.iam.gserviceaccount.com \
   --env WORKER_MODE=job --secret PROVIDER_API_KEY=PROVIDER_API_KEY --mount-bucket myapp-data:/data
 ```
+
+## Upgrading from 0.4
+
+`RunOutcome.sandboxId` is now `string | null`, which breaks code that reads it. It is null when `executeRun`'s signal had already aborted and there was no `resumeSandboxId`, where 0.4 returned `""`; skip recording the sandbox or asking the provider about it then. HKJC's `dispatcher/serve.ts` passes `outcome.sandboxId` to `provider.status` and `dispatch.upsertSandbox` after the finish, and must do that only when it is not null.
+
+`runJob` raises a `maxQuietMs` below twice the claim's `heartbeatMs` to that, and after a shutdown waits at most `shutdownBeatWaitMs` (new, 1 s by default) for a beat in flight rather than a whole interval.
 
 ## Upgrading from 0.3
 

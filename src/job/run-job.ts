@@ -20,6 +20,9 @@ import {
 /** As hk-legal waits: about seven seconds of retries before the execution gives up. */
 const RETRY_DELAYS_MS = [1_000, 2_000, 4_000];
 
+/** Leaves most of Cloud Run's ten seconds between SIGTERM and SIGKILL to the finish. */
+const SHUTDOWN_BEAT_WAIT_MS = 1_000;
+
 /**
  * Returned by `work` or `failed` instead of an ending: leave the run unfinished
  * and stop beating, so the store takes it back when its heartbeat lapses and
@@ -64,8 +67,16 @@ export type JobOptions<Claim> = {
   /** Waits between claims that got no answer. Defaults to 1 s, 2 s and 4 s. */
   retryDelaysMs?: readonly number[];
   /**
+   * Once the job is shutting down, how long a beat in flight is waited for
+   * before the run is finished. Defaults to 1 s, well inside the ten seconds
+   * Cloud Run gives before SIGKILL; otherwise the wait is up to one interval.
+   */
+  shutdownBeatWaitMs?: number;
+  /**
    * Stops the work as `gone` once no beat has got through for this long, as a
    * store that fails or reclaims quiet runs will have done. Off by default.
+   * Raised to twice the claim's `heartbeatMs` when it is less, so a run is
+   * stopped only after a beat had a whole interval to answer and did not.
    */
   maxQuietMs?: number;
   /** Defaults to the claim's own log once there is a claim, and to nowhere before. */
@@ -122,6 +133,13 @@ export function defaultFailed(error: unknown, stopped: StopReason | undefined): 
     : { status: "failed", error: message(error) };
 }
 
+function whenAborted(signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve();
+    signal.addEventListener("abort", () => resolve(), { once: true });
+  });
+}
+
 function wait(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     if (signal.aborted) return resolve();
@@ -170,7 +188,13 @@ export async function runJob<Claim extends ClaimedRun<unknown, never, unknown>>(
     stopped = reason;
     stop.abort(reason);
   };
-  const shutdown = () => halt("shutdown");
+  // Kept apart from `stopped`, which holds only the first reason, so a
+  // shutdown after a cancel still shortens the wait for a beat in flight.
+  const shuttingDown = new AbortController();
+  const shutdown = () => {
+    shuttingDown.abort();
+    halt("shutdown");
+  };
   const signals = options.shutdownSignals ?? ["SIGTERM", "SIGINT"];
   // `once`, so a second Ctrl-C while the run is finishing kills the process.
   for (const name of signals) process.once(name, shutdown);
@@ -203,14 +227,24 @@ export async function runJob<Claim extends ClaimedRun<unknown, never, unknown>>(
 
     // A failed beat is only logged: the store decides when a quiet run is
     // lost, and the next beat that gets through says so. One beat at a time,
-    // and the last is awaited, for up to an interval, before the run is
-    // finished or released, so a late beat does not race the store's ending.
+    // and the last is awaited, for up to an interval (or shutdownBeatWaitMs
+    // once shutting down), before the run is finished or released, so a late
+    // beat does not race the store's ending.
     let inFlight: Promise<void> | undefined;
     let lastBeat = Date.now();
+    // Quiet time counts from the claim and the first beat goes out an interval
+    // in, so a limit of one interval or less would stop a healthy run.
+    const maxQuietMs =
+      options.maxQuietMs === undefined
+        ? undefined
+        : Math.max(options.maxQuietMs, 2 * held.heartbeatMs);
+    if (maxQuietMs !== undefined && maxQuietMs !== options.maxQuietMs) {
+      log(`maxQuietMs ${options.maxQuietMs} is under two beats; using ${maxQuietMs} ms`);
+    }
     beat = setInterval(() => {
       const quiet = Date.now() - lastBeat;
-      if (options.maxQuietMs !== undefined && quiet >= options.maxQuietMs && !stop.signal.aborted) {
-        log(`no beat got through for ${options.maxQuietMs} ms`);
+      if (maxQuietMs !== undefined && quiet >= maxQuietMs && !stop.signal.aborted) {
+        log(`no beat got through for ${maxQuietMs} ms`);
         halt("gone");
       }
       if (inFlight) return;
@@ -246,9 +280,18 @@ export async function runJob<Claim extends ClaimedRun<unknown, never, unknown>>(
     // What stopped the work, not a beat that lands after it.
     const workStopped = stopped;
     clearInterval(beat);
-    // Bounded, so a beat that never answers cannot keep the run from ending.
+    // Bounded, so a beat that never answers cannot keep the run from ending,
+    // and more tightly after a shutdown, even one that comes while waiting,
+    // so the finish goes out before SIGKILL.
     const settle = new AbortController();
-    await Promise.race([inFlight, wait(held.heartbeatMs, settle.signal)]);
+    const shutdownWait = options.shutdownBeatWaitMs ?? SHUTDOWN_BEAT_WAIT_MS;
+    await Promise.race([
+      inFlight,
+      wait(held.heartbeatMs, settle.signal),
+      whenAborted(AbortSignal.any([shuttingDown.signal, settle.signal])).then(() =>
+        wait(shutdownWait, settle.signal),
+      ),
+    ]);
     settle.abort();
 
     if (unmapped) return { kind: "unfinished", stopped: workStopped, ...unmapped, exitCode: 1 };
