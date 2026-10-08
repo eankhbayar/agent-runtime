@@ -53,6 +53,13 @@ export const RUN_TOKEN_PATTERN = /^rt_[A-Za-z0-9_-]{32,}$/;
 const DROP_REQUEST = new Set([
   "host",
   "connection",
+  "keep-alive",
+  "proxy-connection",
+  "proxy-authorization",
+  "transfer-encoding",
+  "te",
+  "trailer",
+  "upgrade",
   "content-length",
   "x-api-key",
   "authorization",

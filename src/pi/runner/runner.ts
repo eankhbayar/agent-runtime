@@ -83,7 +83,9 @@ async function run(options: RunnerOptions, emit: EmitRunEvent): Promise<void> {
   await mkdir(outputsDir, { recursive: true });
   const modelRuntime = await ModelRuntime.create({
     authPath: path.join(agentDir, "auth.json"),
-    modelsPath: path.join(agentDir, "models.json"),
+    // No models.json: the workspace is the agent's to write, so a file planted
+    // there must not change the model, its limits or the headers sent with it.
+    modelsPath: null,
   });
   registerModel(modelRuntime, modelConfig);
   const catalogModel = modelRuntime.getModel(providerId, modelId);

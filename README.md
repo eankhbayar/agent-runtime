@@ -350,11 +350,13 @@ Everything a sandbox leaves behind is treated as hostile. `download` runs `tar` 
 
 Nothing changes at run time unless you ask for the new format. `LlmConfig`, `createInProcessGateway` and `createGatewayHandler` take `{ messagesUrl }` as before, or `{ format: "openai", baseUrl }`; the gateway image still reads `UPSTREAM_MESSAGES_URL`, with `UPSTREAM_FORMAT` and `UPSTREAM_BASE_URL` new and optional. A container started by 0.6's `createGateway` carries the same label and is reused.
 
-One type-level change: `LlmConfig` is now a union, so code that reads `llm.messagesUrl` from a value typed `LlmConfig` no longer compiles until it checks `llm.format !== "openai"` first. HKJC's `dispatcher/job.ts`, `serve.ts` and `run-local.ts` do this. To hand the upstream to the in-process gateway whatever its format, spread the config; the gateway keeps only the upstream's own fields:
+One type-level change: `LlmConfig` is now a union, so code that reads `llm.messagesUrl` from a value typed `LlmConfig` no longer compiles until it checks `llm.format !== "openai"` first. In HKJC that breaks `dispatcher/job.ts`, `dispatcher/serve.ts` and `dispatcher/run-local.ts` (two places), which read `llm.messagesUrl` and must narrow first or pass the whole upstream. To hand the upstream to the in-process gateway whatever its format, spread the config; the gateway keeps only the upstream's own fields:
 
 ```ts
 const gateway = createInProcessGateway({ ...llm, apiKey: process.env.PROVIDER_API_KEY! });
-``` Rebuild the gateway image from the new tag before using the `openai` format, since an old image ignores `UPSTREAM_FORMAT` and would refuse to start without `UPSTREAM_MESSAGES_URL`.
+```
+
+Rebuild the gateway image from the new tag before using the `openai` format, since an old image ignores `UPSTREAM_FORMAT` and would refuse to start without `UPSTREAM_MESSAGES_URL`.
 
 The runner reads `LLM_API` and the variables it brings (see [OpenAI-compatible models](#openai-compatible-models)); without it, it behaves as 0.6. The gateway now also drops `openai-organization` and `openai-project` from requests in both formats. New exports: `GatewayUpstream` from `./core`; `resolveModelConfig`, `registerModel`, `RunnerModelConfig`, `DEFAULT_CONTEXT_WINDOW` and `DEFAULT_MAX_TOKENS` from `./pi/runner`; `chatCompletionEvents` and `FakeUpstream.baseUrl` from `./testing`.
 
