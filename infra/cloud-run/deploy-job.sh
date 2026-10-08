@@ -43,6 +43,10 @@ usage: deploy-job.sh --project PROJECT --region REGION --job JOB --image REPOSIT
                      NAME (version default: latest); repeatable
   --mount-bucket     BUCKET:PATH, a Cloud Storage bucket mounted read-only at
                      PATH; repeatable
+  --mount-bucket-rw  BUCKET:PATH, the same mounted read-write, e.g. for a
+                     DirectorySessionStore; repeatable
+  --sandbox-launcher let the job start sandboxes (gcloud beta), for
+                     CloudRunSandboxProvider
   --cpu              CPUs, e.g. 2 or 1000m (default 1)
   --memory           e.g. 512Mi or 4Gi (default 512Mi)
   --task-timeout     e.g. 3600s, 60m or 1h (default 3600s)
@@ -82,6 +86,8 @@ env_from=()
 env_from_if_set=()
 secrets=()
 bucket_mounts=()
+bucket_mounts_rw=()
+sandbox_launcher=false
 cpu="1"
 memory="512Mi"
 task_timeout="3600s"
@@ -107,6 +113,8 @@ while (($# > 0)); do
     --env-from-if-set) env_from_if_set+=("${2:-}"); shift 2 || usage ;;
     --secret) secrets+=("${2:-}"); shift 2 || usage ;;
     --mount-bucket) bucket_mounts+=("${2:-}"); shift 2 || usage ;;
+    --mount-bucket-rw) bucket_mounts_rw+=("${2:-}"); shift 2 || usage ;;
+    --sandbox-launcher) sandbox_launcher=true; shift ;;
     --cpu) cpu="${2:-}"; shift 2 || usage ;;
     --memory) memory="${2:-}"; shift 2 || usage ;;
     --task-timeout) task_timeout="${2:-}"; shift 2 || usage ;;
@@ -142,7 +150,7 @@ done
 for secret in ${secrets[@]+"${secrets[@]}"}; do
   [[ "$secret" =~ ^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_-]+(:[A-Za-z0-9]+)?$ ]] || fail "--secret must be NAME=SECRET[:VERSION]: $secret"
 done
-for mount in ${bucket_mounts[@]+"${bucket_mounts[@]}"}; do
+for mount in ${bucket_mounts[@]+"${bucket_mounts[@]}"} ${bucket_mounts_rw[@]+"${bucket_mounts_rw[@]}"}; do
   [[ "$mount" =~ ^[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]:/[^,:=]*$ ]] || fail "--mount-bucket must be BUCKET:/PATH: $mount"
 done
 
@@ -257,12 +265,23 @@ for mount in ${bucket_mounts[@]+"${bucket_mounts[@]}"}; do
     --add-volume-mount "volume=bucket-$volume,mount-path=${mount#*:}"
   )
 done
+for mount in ${bucket_mounts_rw[@]+"${bucket_mounts_rw[@]}"}; do
+  volume=$((volume + 1))
+  deploy_flags+=(
+    --add-volume "name=bucket-$volume,type=cloud-storage,bucket=${mount%%:*}"
+    --add-volume-mount "volume=bucket-$volume,mount-path=${mount#*:}"
+  )
+done
 deploy_flags+=(--labels "$(IFS=,; printf '%s' "$commit_label=$commit${labels[*]+,${labels[*]}}")")
 
 if $dry_run && ((${#env_names[@]} > 0)); then
   printf '  with %s from the env file\n' "${env_names[*]}" >&2
 fi
-run gcloud run jobs deploy "$job" "${deploy_flags[@]}"
+if $sandbox_launcher; then
+  run gcloud beta run jobs deploy "$job" "${deploy_flags[@]}" --sandbox-launcher
+else
+  run gcloud run jobs deploy "$job" "${deploy_flags[@]}"
+fi
 
 for invoker in ${invokers[@]+"${invokers[@]}"}; do
   run gcloud run jobs add-iam-policy-binding "$job" --project "$project" --region "$region" \
