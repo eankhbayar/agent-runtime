@@ -66,6 +66,8 @@ export type JobOptions<Claim> = {
   /**
    * Stops the work as `gone` once no beat has got through for this long, as a
    * store that fails or reclaims quiet runs will have done. Off by default.
+   * Raised to twice the claim's `heartbeatMs` when it is less, so a run is
+   * stopped only after a beat had a whole interval to answer and did not.
    */
   maxQuietMs?: number;
   /** Defaults to the claim's own log once there is a claim, and to nowhere before. */
@@ -207,10 +209,19 @@ export async function runJob<Claim extends ClaimedRun<unknown, never, unknown>>(
     // finished or released, so a late beat does not race the store's ending.
     let inFlight: Promise<void> | undefined;
     let lastBeat = Date.now();
+    // Quiet time counts from the claim and the first beat goes out an interval
+    // in, so a limit of one interval or less would stop a healthy run.
+    const maxQuietMs =
+      options.maxQuietMs === undefined
+        ? undefined
+        : Math.max(options.maxQuietMs, 2 * held.heartbeatMs);
+    if (maxQuietMs !== undefined && maxQuietMs !== options.maxQuietMs) {
+      log(`maxQuietMs ${options.maxQuietMs} is under two beats; using ${maxQuietMs} ms`);
+    }
     beat = setInterval(() => {
       const quiet = Date.now() - lastBeat;
-      if (options.maxQuietMs !== undefined && quiet >= options.maxQuietMs && !stop.signal.aborted) {
-        log(`no beat got through for ${options.maxQuietMs} ms`);
+      if (maxQuietMs !== undefined && quiet >= maxQuietMs && !stop.signal.aborted) {
+        log(`no beat got through for ${maxQuietMs} ms`);
         halt("gone");
       }
       if (inFlight) return;

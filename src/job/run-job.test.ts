@@ -489,6 +489,66 @@ describe("runJob", () => {
     expect(result).toMatchObject({ kind: "released", stopped: "gone" });
   });
 
+  it("does not stop a healthy run whose maxQuietMs is no more than its heartbeat", async () => {
+    vi.useFakeTimers();
+    const store = new FakeRunStore({ run_1: {} });
+    store.heartbeatMs = 5_000;
+    const logs: string[] = [];
+    let signal: AbortSignal | undefined;
+    let done: () => void;
+    const finished = new Promise<void>((resolve) => (done = resolve));
+
+    const running = runJob(store, {
+      ...QUICK,
+      runId: "run_1",
+      maxQuietMs: 5_000,
+      log: (m) => logs.push(m),
+      work: async (_claim, workSignal) => {
+        signal = workSignal;
+        await finished;
+        return { status: "succeeded" };
+      },
+    });
+    // The first tick comes an interval after the claim, before any beat.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(store.claims.get("run_1")!.heartbeats).toBe(6);
+    expect(signal!.aborted).toBe(false);
+    done!();
+
+    const result = await running;
+    expect(result).toMatchObject({ kind: "finished", ending: { status: "succeeded" } });
+    expect(result.kind === "finished" && result.stopped).toBeUndefined();
+    expect(logs).toContain("maxQuietMs 5000 is under two beats; using 10000 ms");
+  });
+
+  it("stops a quiet run only once a beat had a whole interval to get through", async () => {
+    vi.useFakeTimers();
+    const store = new FakeRunStore({ run_1: {} });
+    store.heartbeatMs = 5_000;
+    let signal: AbortSignal | undefined;
+
+    const running = runJob(store, {
+      ...QUICK,
+      runId: "run_1",
+      maxQuietMs: 1,
+      log: () => {},
+      work: async (claim, workSignal) => {
+        signal = workSignal;
+        claim.heartbeat = async () => {
+          throw new StoreUnreachableError("timed out");
+        };
+        await aborted(workSignal);
+        return RELEASE;
+      },
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(signal!.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(signal!.reason).toBe("gone");
+
+    expect(await running).toMatchObject({ kind: "released", stopped: "gone" });
+  });
+
   it("reports a run it could not finish", async () => {
     const store = new FakeRunStore({ run_1: {} });
     const lost = new StoreUnreachableError("finish got no answer");
