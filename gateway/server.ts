@@ -1,9 +1,12 @@
 // Egress gateway: the only host a sandbox can reach. It holds the LLM provider
-// key, accepts a per-run token in its place, and proxies Anthropic-format
-// Messages API calls to one upstream endpoint.
+// key, accepts a per-run token in its place, and proxies model calls to one
+// upstream: Anthropic Messages, or OpenAI Chat Completions.
 //
-//   UPSTREAM_MESSAGES_URL   full Messages endpoint, e.g. https://api.kimi.com/coding/v1/messages
-//   UPSTREAM_API_KEY        the provider key, sent as x-api-key; never enters a sandbox
+//   UPSTREAM_FORMAT         anthropic (default) or openai
+//   UPSTREAM_MESSAGES_URL   anthropic: full Messages endpoint, e.g. https://api.kimi.com/coding/v1/messages
+//   UPSTREAM_BASE_URL       openai: the API base, e.g. https://api.openai.com/v1; calls go to <base>/chat/completions
+//   UPSTREAM_API_KEY        the provider key, sent as x-api-key (anthropic) or
+//                           Authorization: Bearer (openai); never enters a sandbox
 //   TOKEN_DIR               default /run/gateway/tokens
 //   PORT                    default 8080
 //
@@ -19,12 +22,22 @@ import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
 
-import { createGatewayHandler, type GatewayGrant } from "./gateway-handler.ts";
+import { createGatewayHandler, type GatewayGrant, type GatewayUpstream } from "./gateway-handler.ts";
+
+function upstreamFromEnv(env: NodeJS.ProcessEnv): GatewayUpstream {
+  const format = env.UPSTREAM_FORMAT || "anthropic";
+  if (format === "openai") {
+    if (!env.UPSTREAM_BASE_URL) throw new Error("UPSTREAM_BASE_URL is required when UPSTREAM_FORMAT=openai");
+    return { format, baseUrl: env.UPSTREAM_BASE_URL };
+  }
+  if (format !== "anthropic") throw new Error("UPSTREAM_FORMAT must be anthropic or openai");
+  if (!env.UPSTREAM_MESSAGES_URL) throw new Error("UPSTREAM_MESSAGES_URL is required");
+  return { format, messagesUrl: env.UPSTREAM_MESSAGES_URL };
+}
 
 const apiKey = process.env.UPSTREAM_API_KEY;
-const messagesUrl = process.env.UPSTREAM_MESSAGES_URL;
-if (!apiKey || !messagesUrl)
-  throw new Error("UPSTREAM_API_KEY and UPSTREAM_MESSAGES_URL are required");
+if (!apiKey) throw new Error("UPSTREAM_API_KEY is required");
+const upstream = upstreamFromEnv(process.env);
 const tokenDir = process.env.TOKEN_DIR ?? "/run/gateway/tokens";
 const port = Number(process.env.PORT ?? 8080);
 
@@ -45,6 +58,12 @@ function log(entry: Record<string, unknown>): void {
   console.log(JSON.stringify({ ts: new Date().toISOString(), ...entry }));
 }
 
-const server = createServer(createGatewayHandler({ messagesUrl, apiKey, grantFor, log }));
+const server = createServer(createGatewayHandler({ ...upstream, apiKey, grantFor, log }));
 
-server.listen(port, () => log({ listening: port, upstream: messagesUrl }));
+server.listen(port, () =>
+  log({
+    listening: port,
+    format: upstream.format,
+    upstream: upstream.format === "openai" ? upstream.baseUrl : upstream.messagesUrl,
+  }),
+);

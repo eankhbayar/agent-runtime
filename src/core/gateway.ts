@@ -8,7 +8,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Duplex } from "node:stream";
 
-import { createGatewayHandler, type GatewayGrant } from "./gateway-handler.ts";
+import { createGatewayHandler, type GatewayGrant, type GatewayUpstream } from "./gateway-handler.ts";
 import type { TokenGrant } from "./run.ts";
 
 /** Run tokens held in this process, for a gateway in this process. */
@@ -37,9 +37,11 @@ export class MemoryTokenGrant implements TokenGrant {
   };
 }
 
-export type InProcessGatewayOptions = {
-  /** The full Messages endpoint, e.g. `https://api.kimi.com/coding/v1/messages`. */
-  messagesUrl: string;
+/**
+ * `{ messagesUrl }` for an Anthropic Messages upstream, or
+ * `{ format: "openai", baseUrl }` for an OpenAI Chat Completions one.
+ */
+export type InProcessGatewayOptions = GatewayUpstream & {
   /** The provider key. */
   apiKey: string;
   /** One entry per request; by default a JSON line on stderr. */
@@ -58,6 +60,13 @@ export type InProcessGateway = TokenGrant & {
   server: Server;
 };
 
+// Only the upstream's own fields, so nothing else in the options rides along.
+function upstreamOf(options: GatewayUpstream): GatewayUpstream {
+  return options.format === "openai"
+    ? { format: "openai", baseUrl: options.baseUrl }
+    : { format: "anthropic", messagesUrl: options.messagesUrl };
+}
+
 function defaultLog(entry: Record<string, unknown>): void {
   process.stderr.write(
     `${JSON.stringify({ ts: new Date().toISOString(), component: "gateway", ...entry })}\n`,
@@ -66,15 +75,16 @@ function defaultLog(entry: Record<string, unknown>): void {
 
 /**
  * The Docker gateway's handling (token check, key injection, unbuffered
- * streaming; Anthropic-format Messages only) with tokens in memory. Pass it as
- * executeRun's `tokens`, and `connect` as the Cloud Run provider's bridge.
+ * streaming; Anthropic Messages or OpenAI Chat Completions) with tokens in
+ * memory. Pass it as executeRun's `tokens`, and `connect` as the Cloud Run
+ * provider's bridge.
  */
 export function createInProcessGateway(options: InProcessGatewayOptions): InProcessGateway {
   if (!options.apiKey) throw new Error("The gateway needs the provider API key");
   const tokens = new MemoryTokenGrant();
   const server = createServer(
     createGatewayHandler({
-      messagesUrl: options.messagesUrl,
+      ...upstreamOf(options),
       apiKey: options.apiKey,
       grantFor: tokens.lookup,
       log: options.log ?? defaultLog,

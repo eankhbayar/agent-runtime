@@ -1,8 +1,9 @@
 // The egress gateway's request handling: a per-run token in place of the
-// provider key, the key added on the way out, and Anthropic-format Messages
-// calls proxied to one upstream endpoint with the response streamed back
-// unbuffered. The Docker gateway image (gateway/server.ts) and the in-job
-// gateway (gateway.ts) both serve it.
+// provider key, the key added on the way out, and model calls proxied to one
+// upstream with the response streamed back unbuffered. The upstream speaks
+// either the Anthropic Messages format (`x-api-key`) or the OpenAI Chat
+// Completions format (`Authorization: Bearer`). The Docker gateway image
+// (gateway/server.ts) and the in-job gateway (gateway.ts) both serve it.
 //
 // This file imports nothing but Node, because gateway/gateway-handler.ts is a
 // copy of it that the gateway image runs on its own. Edit this one; a test
@@ -16,10 +17,23 @@ import type { ReadableStream as WebReadableStream } from "node:stream/web";
 /** Who a valid run token belongs to. */
 export type GatewayGrant = { runId: string };
 
-export type GatewayHandlerOptions = {
-  /** The full Messages endpoint, e.g. `https://api.kimi.com/coding/v1/messages`. */
-  messagesUrl: string;
-  /** The provider key, sent as `x-api-key`. Never reaches a sandbox. */
+/** The model endpoint the gateway proxies to, and the format it speaks. */
+export type GatewayUpstream =
+  | {
+      /** Anthropic Messages: the agent calls `/v1/messages` with its run token as `x-api-key`. */
+      format?: "anthropic";
+      /** The full Messages endpoint, e.g. `https://api.kimi.com/coding/v1/messages`. */
+      messagesUrl: string;
+    }
+  | {
+      /** OpenAI Chat Completions: the agent calls `/v1/chat/completions` with `Authorization: Bearer <run token>`. */
+      format: "openai";
+      /** The API base the endpoint hangs off, e.g. `https://api.openai.com/v1`. */
+      baseUrl: string;
+    };
+
+export type GatewayHandlerOptions = GatewayUpstream & {
+  /** The provider key, sent as `x-api-key` or `Authorization: Bearer`. Never reaches a sandbox. */
   apiKey: string;
   /** Looks a well-formed run token up; null when it is unknown, revoked or expired. */
   grantFor: (token: string) => Promise<GatewayGrant | null>;
@@ -34,8 +48,24 @@ export type GatewayHandler = (req: IncomingMessage, res: ServerResponse) => Prom
 /** What a run token looks like; anything else is refused without a lookup. */
 export const RUN_TOKEN_PATTERN = /^rt_[A-Za-z0-9_-]{32,}$/;
 
-// Hop-by-hop and auth headers are never forwarded in either direction.
-const DROP_REQUEST = new Set(["host", "connection", "content-length", "x-api-key", "authorization"]);
+// Hop-by-hop and auth headers are never forwarded in either direction, nor
+// headers that would let a sandbox pick which account the key bills.
+const DROP_REQUEST = new Set([
+  "host",
+  "connection",
+  "keep-alive",
+  "proxy-connection",
+  "proxy-authorization",
+  "transfer-encoding",
+  "te",
+  "trailer",
+  "upgrade",
+  "content-length",
+  "x-api-key",
+  "authorization",
+  "openai-organization",
+  "openai-project",
+]);
 const DROP_RESPONSE = new Set([
   "connection",
   "content-length",
@@ -43,15 +73,34 @@ const DROP_RESPONSE = new Set([
   "transfer-encoding",
 ]);
 
+/** The run token a request carries: `x-api-key` for Anthropic, `Authorization: Bearer` for OpenAI. */
+function runTokenOf(req: IncomingMessage, openai: boolean): string | undefined {
+  if (!openai) {
+    const key = req.headers["x-api-key"];
+    return typeof key === "string" ? key : undefined;
+  }
+  const match = /^Bearer (\S+)$/.exec(req.headers.authorization ?? "");
+  return match?.[1];
+}
+
 export function createGatewayHandler(options: GatewayHandlerOptions): GatewayHandler {
-  const { apiKey, messagesUrl } = options;
+  const { apiKey } = options;
   const log = options.log ?? (() => {});
   const upstreamFetch = options.fetch ?? fetch;
-  // Sandbox clients use the gateway as their base URL, so the SDK calls /v1/messages.
-  const upstreamByPath = new Map([
-    ["/v1/messages", messagesUrl],
-    ["/v1/messages/count_tokens", `${messagesUrl}/count_tokens`],
-  ]);
+  const openai = options.format === "openai";
+  // Sandbox clients use the gateway as their base URL, so the Anthropic SDK
+  // calls /v1/messages, and an OpenAI client given <gateway>/v1 calls /v1/chat/completions.
+  let upstreamByPath: Map<string, string>;
+  if (options.format === "openai") {
+    const baseUrl = options.baseUrl.replace(/\/+$/, "");
+    upstreamByPath = new Map([["/v1/chat/completions", `${baseUrl}/chat/completions`]]);
+  } else {
+    const { messagesUrl } = options;
+    upstreamByPath = new Map([
+      ["/v1/messages", messagesUrl],
+      ["/v1/messages/count_tokens", `${messagesUrl}/count_tokens`],
+    ]);
+  }
 
   const forwardHeaders = (req: IncomingMessage): Headers => {
     const headers = new Headers();
@@ -59,7 +108,8 @@ export function createGatewayHandler(options: GatewayHandlerOptions): GatewayHan
       if (value === undefined || DROP_REQUEST.has(name)) continue;
       headers.set(name, Array.isArray(value) ? value.join(", ") : value);
     }
-    headers.set("x-api-key", apiKey);
+    if (openai) headers.set("authorization", `Bearer ${apiKey}`);
+    else headers.set("x-api-key", apiKey);
     return headers;
   };
 
@@ -74,7 +124,7 @@ export function createGatewayHandler(options: GatewayHandlerOptions): GatewayHan
       res.writeHead(404, { "content-type": "application/json" }).end('{"error":"not_found"}');
       return;
     }
-    const token = req.headers["x-api-key"];
+    const token = runTokenOf(req, openai);
     const grant =
       typeof token === "string" && RUN_TOKEN_PATTERN.test(token)
         ? await options.grantFor(token).catch(() => null)

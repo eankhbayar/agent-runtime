@@ -4,16 +4,30 @@
 import { createHash, randomBytes } from "node:crypto";
 
 import { docker, DockerError } from "./docker.ts";
+import type { GatewayUpstream } from "../../core/gateway-handler.ts";
 import type { TokenGrant } from "../../core/run.ts";
 
-// The model endpoint. The gateway proxies the Anthropic Messages format with
-// x-api-key auth and nothing else.
-export type LlmConfig = {
+// The model endpoint. The gateway proxies either the Anthropic Messages format
+// (`messagesUrl`, x-api-key auth) or, with `format: "openai"`, the OpenAI Chat
+// Completions format (`baseUrl`, bearer auth), and nothing else.
+export type LlmConfig = GatewayUpstream & {
   provider: string;
   model: string;
-  messagesUrl: string;
   apiKey: string | undefined;
 };
+
+/** What the gateway container is labelled with, so a changed upstream restarts it. */
+function upstreamLabelValue(llm: GatewayUpstream): string {
+  // An Anthropic upstream keeps the bare URL that 0.6 wrote, so upgrading reuses the container.
+  return llm.format === "openai" ? `openai ${llm.baseUrl}` : llm.messagesUrl;
+}
+
+/** The gateway image's environment for an upstream (the key is added separately). */
+function upstreamEnv(llm: GatewayUpstream): Record<string, string> {
+  return llm.format === "openai"
+    ? { UPSTREAM_FORMAT: "openai", UPSTREAM_BASE_URL: llm.baseUrl }
+    : { UPSTREAM_MESSAGES_URL: llm.messagesUrl };
+}
 
 export type GatewayOptions = {
   /** Container name, e.g. `myproject-egress-gateway`. */
@@ -52,26 +66,29 @@ export function createGateway(options: GatewayOptions): Gateway {
       let state: string | null = null;
       let upstream: string | null = null;
       try {
-        [state, upstream] = (
+        const inspected = (
           await docker([
             "inspect",
             "--format",
             `{{.State.Status}} {{index .Config.Labels "${upstreamLabel}"}}`,
             container,
           ])
-        )
-          .trim()
-          .split(" ");
+        ).trim();
+        const space = inspected.indexOf(" ");
+        [state, upstream] =
+          space === -1 ? [inspected, ""] : [inspected.slice(0, space), inspected.slice(space + 1)];
       } catch (error) {
         if (!(error instanceof DockerError)) throw error;
       }
-      if (state === "running" && upstream === opts.llm.messagesUrl && !opts.restart) {
+      const label = upstreamLabelValue(opts.llm);
+      if (state === "running" && upstream === label && !opts.restart) {
         return "reused";
       }
       if (state !== null) await docker(["rm", "--force", container]);
 
       if (!opts.llm.apiKey) throw new Error("The gateway needs the provider API key to start");
       // `-e NAME` without a value: docker reads the key from its env, so it stays out of argv.
+      const env = { ...upstreamEnv(opts.llm), UPSTREAM_API_KEY: opts.llm.apiKey };
       await docker(
         [
           "run",
@@ -83,18 +100,15 @@ export function createGateway(options: GatewayOptions): Gateway {
           "--label",
           "agent-runtime.gateway=1",
           "--label",
-          `${upstreamLabel}=${opts.llm.messagesUrl}`,
+          `${upstreamLabel}=${label}`,
           "--cap-drop",
           "ALL",
           "--security-opt",
           "no-new-privileges",
-          "-e",
-          "UPSTREAM_MESSAGES_URL",
-          "-e",
-          "UPSTREAM_API_KEY",
+          ...Object.keys(env).flatMap((name) => ["-e", name]),
           opts.image,
         ],
-        { env: { UPSTREAM_MESSAGES_URL: opts.llm.messagesUrl, UPSTREAM_API_KEY: opts.llm.apiKey } },
+        { env },
       );
       return "started";
     },

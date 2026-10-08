@@ -17,12 +17,17 @@ const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 
 type Answer = { status: number; body: string; arrivals: number[] };
 
-/** One POST, timing each chunk from the moment the response began. */
+// One streamed text delta, in each format.
+const MESSAGES_DELTA = /event: content_block_delta/g;
+const CHAT_DELTA = /"delta":\{"content":"[^"]/g;
+
+/** One POST, timing each text delta from the moment the response began. */
 function post(
   target: { url: string } | { connect: () => Duplex },
   pathName: string,
   headers: Record<string, string>,
   body = '{"model":"m","stream":true,"messages":[]}',
+  delta: RegExp = MESSAGES_DELTA,
 ): Promise<Answer> {
   return new Promise((resolve, reject) => {
     const base = "url" in target ? new URL(target.url) : null;
@@ -41,7 +46,7 @@ function post(
         let text = "";
         res.setEncoding("utf8");
         res.on("data", (d: string) => {
-          for (const _ of d.matchAll(/event: content_block_delta/g)) arrivals.push(Date.now() - started);
+          for (const _ of d.matchAll(delta)) arrivals.push(Date.now() - started);
           text += d;
         });
         res.on("end", () => resolve({ status: res.statusCode ?? 0, body: text, arrivals }));
@@ -60,11 +65,13 @@ afterEach(async () => {
   gateway = upstream = undefined;
 });
 
-async function setup(gapMs = 0) {
+async function setup(gapMs = 0, format: "anthropic" | "openai" = "anthropic") {
   upstream = await startFakeUpstream({ apiKey: "sk-provider", gapMs });
   const entries: Record<string, unknown>[] = [];
   gateway = createInProcessGateway({
-    messagesUrl: upstream.messagesUrl,
+    ...(format === "openai"
+      ? { format, baseUrl: upstream.baseUrl }
+      : { messagesUrl: upstream.messagesUrl }),
     apiKey: "sk-provider",
     log: (entry) => entries.push(entry),
   });
@@ -184,6 +191,126 @@ describe("createInProcessGateway", () => {
   });
 });
 
+describe("createInProcessGateway with an OpenAI-format upstream", () => {
+  const chat = (url: string, headers: Record<string, string>) =>
+    post({ url }, "/v1/chat/completions", headers, undefined, CHAT_DELTA);
+
+  it("takes the run token as a bearer token, sends the key as one, and streams as it comes", async () => {
+    const { upstream, gateway, url, entries } = await setup(80, "openai");
+    const token = await gateway.grant("run_1", 60_000);
+    const answer = await chat(url, {
+      authorization: `Bearer ${token}`,
+      "x-api-key": "should-not-pass",
+      "openai-organization": "org-elsewhere",
+      "openai-project": "proj-elsewhere",
+      "x-client-request-id": "req-1",
+    });
+
+    expect(answer.status).toBe(200);
+    expect(answer.body).toContain("data: [DONE]");
+    const seen = upstream.requests[0]!;
+    expect(seen.path).toBe("/v1/chat/completions");
+    expect(seen.headers.authorization).toBe("Bearer sk-provider");
+    expect(seen.headers["x-api-key"]).toBeUndefined();
+    expect(seen.headers["openai-organization"]).toBeUndefined();
+    expect(seen.headers["openai-project"]).toBeUndefined();
+    expect(seen.headers["x-client-request-id"]).toBe("req-1");
+    expect(JSON.stringify(seen.headers)).not.toContain(token);
+    expect(seen.body).toMatchObject({ model: "m", stream: true });
+    // Five words 80 ms apart: buffered, they would all land together at the end.
+    expect(answer.arrivals).toHaveLength(5);
+    expect(answer.arrivals.at(-1)! - answer.arrivals[0]!).toBeGreaterThan(200);
+    expect(entries.at(-1)).toMatchObject({ runId: "run_1", path: "/v1/chat/completions", status: 200 });
+    expect(JSON.stringify(entries)).not.toContain(token);
+    expect(JSON.stringify(entries)).not.toContain("sk-provider");
+  });
+
+  it("refuses a token sent any other way, and every bad token", async () => {
+    const { upstream, gateway, url, entries } = await setup(0, "openai");
+    const token = await gateway.grant("run_1", 60_000);
+    const revoked = await gateway.grant("run_1", 60_000);
+    await gateway.revoke(revoked);
+    const attempts: Record<string, string>[] = [
+      {},
+      { "x-api-key": token },
+      { authorization: token },
+      { authorization: `Basic ${token}` },
+      { authorization: "Bearer sk-provider" },
+      { authorization: `Bearer rt_${"x".repeat(43)}` },
+      { authorization: `Bearer ${revoked}` },
+    ];
+    for (const headers of attempts) {
+      expect(await chat(url, headers)).toMatchObject({ status: 401, body: '{"error":"invalid_run_token"}' });
+    }
+    expect(upstream.requests).toEqual([]);
+    expect(JSON.stringify(entries)).not.toContain(token);
+  });
+
+  it("proxies chat completions only, not the Messages paths", async () => {
+    const { upstream, gateway, url } = await setup(0, "openai");
+    const token = await gateway.grant("run_1", 60_000);
+    const bearer = { authorization: `Bearer ${token}` };
+    const whole = await post({ url }, "/v1/chat/completions", bearer, '{"model":"m","messages":[]}');
+    expect(whole.status).toBe(200);
+    expect(JSON.parse(whole.body)).toMatchObject({ choices: [{ message: { content: "Hello from the fake model." } }] });
+    for (const pathName of ["/v1/messages", "/v1/messages/count_tokens", "/v1/completions", "/chat/completions"]) {
+      expect((await post({ url }, pathName, bearer)).status).toBe(404);
+    }
+    expect(upstream.requests).toHaveLength(1);
+  });
+
+  it("survives an agent that hangs up in the middle of a streamed answer", async () => {
+    const { gateway, url } = await setup(150, "openai");
+    const token = await gateway.grant("run_1", 60_000);
+    const crashes: unknown[] = [];
+    const onCrash = (error: unknown) => crashes.push(error);
+    process.on("uncaughtException", onCrash);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const base = new URL(url);
+        const req = request(
+          {
+            method: "POST",
+            path: "/v1/chat/completions",
+            host: base.hostname,
+            port: Number(base.port),
+            agent: false,
+            headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+          },
+          (res) => {
+            res.once("data", () => {
+              req.destroy();
+              resolve();
+            });
+          },
+        );
+        req.on("error", () => {});
+        req.end('{"model":"m","stream":true,"messages":[]}');
+        setTimeout(() => reject(new Error("no answer")), 5_000);
+      });
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      expect(crashes).toEqual([]);
+      expect((await chat(url, { authorization: `Bearer ${token}` })).status).toBe(200);
+    } finally {
+      process.off("uncaughtException", onCrash);
+    }
+  });
+
+  it("joins the base URL and the path whatever slash the base ends with", async () => {
+    upstream = await startFakeUpstream({ apiKey: "sk-provider" });
+    gateway = createInProcessGateway({
+      format: "openai",
+      baseUrl: `${upstream.baseUrl}/`,
+      apiKey: "sk-provider",
+      log: () => {},
+    });
+    const url = await gateway.listen();
+    const token = await gateway.grant("run_1", 60_000);
+    expect((await chat(url, { authorization: `Bearer ${token}` })).status).toBe(200);
+    expect(upstream.requests[0]!.path).toBe("/v1/chat/completions");
+  });
+});
+
 describe("the gateway image's server", { timeout: 30_000 }, () => {
   it("runs the same handler as core, from a copy kept identical", async () => {
     const [core, copy] = await Promise.all([
@@ -193,8 +320,8 @@ describe("the gateway image's server", { timeout: 30_000 }, () => {
     expect(copy, "copy src/core/gateway-handler.ts to gateway/").toBe(core);
   });
 
-  it("still checks token files and streams the upstream's answer", async () => {
-    upstream = await startFakeUpstream({ apiKey: "sk-provider" });
+  /** Starts gateway/server.ts with `env`, one valid token in its token directory. */
+  async function startServer(env: Record<string, string>) {
     const tokenDir = await mkdtemp(path.join(tmpdir(), "agent-runtime-tokens-"));
     const token = `rt_${"t".repeat(43)}`;
     const hash = createHash("sha256").update(token).digest("hex");
@@ -208,18 +335,23 @@ describe("the gateway image's server", { timeout: 30_000 }, () => {
     await new Promise((resolve) => probe.close(resolve));
 
     const server = spawn(process.execPath, [path.join(repo, "gateway/server.ts")], {
-      env: {
-        ...process.env,
-        UPSTREAM_MESSAGES_URL: upstream.messagesUrl,
-        UPSTREAM_API_KEY: "sk-provider",
-        TOKEN_DIR: tokenDir,
-        PORT: String(port),
-      },
+      env: { ...process.env, ...env, TOKEN_DIR: tokenDir, PORT: String(port) },
       stdio: ["ignore", "pipe", "inherit"],
     });
+    const listening = await new Promise<string>((resolve) =>
+      server.stdout.once("data", (d: Buffer) => resolve(String(d))),
+    );
+    return { url: `http://127.0.0.1:${port}`, token, server, listening };
+  }
+
+  it("still checks token files and streams the upstream's answer", async () => {
+    upstream = await startFakeUpstream({ apiKey: "sk-provider" });
+    const { url, token, server, listening } = await startServer({
+      UPSTREAM_MESSAGES_URL: upstream.messagesUrl,
+      UPSTREAM_API_KEY: "sk-provider",
+    });
     try {
-      await new Promise<void>((resolve) => server.stdout.once("data", () => resolve()));
-      const url = `http://127.0.0.1:${port}`;
+      expect(JSON.parse(listening)).toMatchObject({ format: "anthropic", upstream: upstream.messagesUrl });
       const answer = await post({ url }, "/v1/messages", { "x-api-key": token });
       expect(answer.status).toBe(200);
       expect(answer.body).toContain("event: message_stop");
@@ -229,6 +361,46 @@ describe("the gateway image's server", { timeout: 30_000 }, () => {
       );
     } finally {
       server.kill();
+    }
+  });
+
+  it("proxies chat completions with UPSTREAM_FORMAT=openai", async () => {
+    upstream = await startFakeUpstream({ apiKey: "sk-provider" });
+    const { url, token, server, listening } = await startServer({
+      UPSTREAM_FORMAT: "openai",
+      UPSTREAM_BASE_URL: upstream.baseUrl,
+      UPSTREAM_API_KEY: "sk-provider",
+    });
+    try {
+      expect(listening).not.toContain("sk-provider");
+      expect(JSON.parse(listening)).toMatchObject({ format: "openai", upstream: upstream.baseUrl });
+      const answer = await post({ url }, "/v1/chat/completions", { authorization: `Bearer ${token}` });
+      expect(answer.status).toBe(200);
+      expect(answer.body).toContain("data: [DONE]");
+      expect(upstream.requests[0]!.headers.authorization).toBe("Bearer sk-provider");
+      expect((await post({ url }, "/v1/messages", { "x-api-key": token })).status).toBe(404);
+    } finally {
+      server.kill();
+    }
+  });
+
+  it("refuses to start without the upstream its format needs", async () => {
+    for (const env of [
+      { UPSTREAM_API_KEY: "sk-provider" },
+      { UPSTREAM_API_KEY: "sk-provider", UPSTREAM_FORMAT: "openai", UPSTREAM_MESSAGES_URL: "http://x/v1/messages" },
+      { UPSTREAM_API_KEY: "sk-provider", UPSTREAM_FORMAT: "gemini", UPSTREAM_BASE_URL: "http://x/v1" },
+      { UPSTREAM_FORMAT: "openai", UPSTREAM_BASE_URL: "http://x/v1" },
+    ]) {
+      const server = spawn(process.execPath, [path.join(repo, "gateway/server.ts")], {
+        env: {
+          PATH: process.env.PATH ?? "",
+          ...env,
+          PORT: "0",
+        },
+        stdio: ["ignore", "ignore", "ignore"],
+      });
+      const code = await new Promise<number | null>((resolve) => server.once("exit", resolve));
+      expect(code, JSON.stringify(env)).not.toBe(0);
     }
   });
 });
