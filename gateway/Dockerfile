@@ -2,7 +2,7 @@
 # only container attached both to sandbox networks and to the internet.
 FROM node:24.21.0-bookworm-slim
 
-COPY server.ts /opt/gateway/server.ts
+COPY server.ts gateway-handler.ts /opt/gateway/
 RUN mkdir -p /run/gateway/tokens && chown node:node /run/gateway/tokens && chmod 700 /run/gateway/tokens
 
 USER node
