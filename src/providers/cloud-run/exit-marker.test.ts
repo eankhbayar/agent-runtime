@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { createFrameDecoder, DATA, encodeFrame, END, OPEN } from "./frames.ts";
+import { createFrameDecoder, DATA, encodeData, encodeFrame, END, MAX_FRAME_PAYLOAD, OPEN } from "./frames.ts";
 import { ExitMarkerReader, newExitMarker, splitExitMarker } from "./exit-marker.ts";
 
 function read(chunks: string[], marker: string) {
@@ -80,5 +80,25 @@ describe("tunnel frames", () => {
         [END, 1, 0],
       ]);
     }
+  });
+
+  it("refuses a frame over the limit as soon as its header arrives, and splits large data to fit", () => {
+    const errors: string[] = [];
+    const seen: number[] = [];
+    const decode = createFrameDecoder((type) => seen.push(type), (e) => errors.push(e.message));
+    const head = Buffer.alloc(9);
+    head.writeUInt8(DATA, 0);
+    head.writeUInt32BE(1, 1);
+    head.writeUInt32BE(MAX_FRAME_PAYLOAD + 1, 5);
+    decode(Buffer.concat([encodeFrame(OPEN, 1), head]));
+    decode(encodeFrame(END, 1));
+    expect(seen).toEqual([OPEN]);
+    expect(errors).toHaveLength(1);
+
+    const frames: number[] = [];
+    const ok = createFrameDecoder((_t, _i, payload) => frames.push(payload.length));
+    ok(encodeData(2, Buffer.alloc(3 * MAX_FRAME_PAYLOAD)));
+    expect(frames.reduce((a, b) => a + b, 0)).toBe(3 * MAX_FRAME_PAYLOAD);
+    expect(Math.max(...frames)).toBeLessThanOrEqual(MAX_FRAME_PAYLOAD);
   });
 });

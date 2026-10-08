@@ -2,10 +2,12 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer, request, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { PassThrough, type Duplex } from "node:stream";
 
 import { afterEach, describe, expect, it } from "vitest";
 
 import { startBridge, type Bridge, type BridgeProcess } from "./bridge.ts";
+import { DATA, encodeData, encodeFrame, END, OPEN } from "./frames.ts";
 
 // The shim runs on this host here, as it would in the sandbox: its loopback
 // port stands for the sandbox's.
@@ -140,5 +142,110 @@ describe("startBridge", { timeout: 30_000 }, () => {
         command: [process.execPath, "-e", "process.exit(3)"],
       }),
     ).rejects.toThrow("exited before it was ready");
+  });
+});
+
+/** A shim scripted from the test: what it "sends" is written to its stdout here. */
+function scriptedShim() {
+  const shims: { stdout: PassThrough; stdin: PassThrough; killed: boolean; exit: () => void }[] = [];
+  const openShim = (): BridgeProcess => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    let exit!: () => void;
+    const exited = new Promise<void>((resolve) => (exit = resolve));
+    const shim = { stdout, stdin, killed: false, exit };
+    shims.push(shim);
+    setImmediate(() => stderr.write("READY 8080\n"));
+    return {
+      stdin,
+      stdout,
+      stderr,
+      exited,
+      kill: () => {
+        shim.killed = true;
+        exit();
+      },
+    };
+  };
+  return { shims, openShim };
+}
+
+const waitFor = async (check: () => boolean) => {
+  for (let i = 0; i < 100 && !check(); i++) await new Promise((resolve) => setTimeout(resolve, 10));
+  expect(check()).toBe(true);
+};
+
+describe("startBridge with a hostile shim", () => {
+  const start = async (overrides: Partial<Parameters<typeof startBridge>[0]> = {}) => {
+    const { shims, openShim } = scriptedShim();
+    const streams: Duplex[] = [];
+    const lines: string[] = [];
+    bridge = await startBridge({
+      open: openShim,
+      port: 8080,
+      onConnection: (stream) => streams.push(stream),
+      restartMs: 10,
+      log: (line) => lines.push(line),
+      ...overrides,
+    });
+    return { shims, streams, lines };
+  };
+
+  it("kills a shim that announces a frame over the limit, before holding any of it", async () => {
+    const { shims, lines } = await start();
+    const head = Buffer.alloc(9);
+    head.writeUInt8(DATA, 0);
+    head.writeUInt32BE(1, 1);
+    head.writeUInt32BE(0xffffffff, 5);
+    shims[0]!.stdout.write(head);
+    await waitFor(() => shims[0]!.killed);
+    expect(lines.join("\n")).toMatch(/over the 1048576 byte limit/);
+    // Another starts, and works.
+    await waitFor(() => shims.length === 2);
+    expect(bridge!.restarts).toBe(1);
+  });
+
+  it("kills a shim that opens too many streams, or reuses an id, or sends an unknown frame", async () => {
+    const { shims, streams } = await start({ maxStreams: 3 });
+    for (let id = 1; id <= 4; id++) shims[0]!.stdout.write(encodeFrame(OPEN, id));
+    await waitFor(() => shims[0]!.killed);
+    expect(streams).toHaveLength(3);
+    expect(streams.every((s) => s.destroyed)).toBe(true);
+
+    await waitFor(() => shims.length === 2);
+    shims[1]!.stdout.write(encodeFrame(OPEN, 7));
+    shims[1]!.stdout.write(encodeFrame(END, 7));
+    shims[1]!.stdout.write(encodeFrame(OPEN, 7));
+    await waitFor(() => shims[1]!.killed);
+
+    await waitFor(() => shims.length === 3);
+    shims[2]!.stdout.write(encodeFrame(77, 1));
+    await waitFor(() => shims[2]!.killed);
+  });
+
+  it("stops reading the shim while a stream's reader is behind, and starts again when it reads", async () => {
+    const { shims, streams } = await start();
+    const shim = shims[0]!;
+    shim.stdout.write(encodeFrame(OPEN, 1));
+    await waitFor(() => streams.length === 1);
+    // Nothing reads the stream, so after its buffer fills the shim is paused.
+    for (let i = 0; i < 8; i++) shim.stdout.write(encodeData(1, Buffer.alloc(16 * 1024)));
+    await waitFor(() => shim.stdout.isPaused());
+    streams[0]!.resume();
+    await waitFor(() => !shim.stdout.isPaused());
+  });
+
+  it("gives up on a shim that keeps dying", async () => {
+    const { shims, lines } = await start({ maxRestartsPerMinute: 3 });
+    for (let i = 0; i < 4; i++) {
+      await waitFor(() => shims.length === i + 1);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      shims[i]!.exit();
+    }
+    await waitFor(() => lines.some((l) => l.includes("not starting it again")));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(shims).toHaveLength(4);
+    expect(bridge!.restarts).toBe(3);
   });
 });

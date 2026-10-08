@@ -14,7 +14,7 @@
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 
-import { DATA, END, OPEN, encodeFrame, readFrames } from "./frames.ts";
+import { DATA, END, OPEN, encodeData, encodeFrame, readFrames } from "./frames.ts";
 
 const port = Number(process.argv[2]);
 if (!Number.isInteger(port) || port <= 0 || port > 65_535) {
@@ -35,11 +35,18 @@ function send(frame: Buffer, from?: Socket): void {
   }
 }
 
-readFrames(process.stdin, (type, id, payload) => {
-  const socket = sockets.get(id);
-  if (type === DATA) socket?.write(payload);
-  else if (type === END) socket?.end();
-});
+readFrames(
+  process.stdin,
+  (type, id, payload) => {
+    const socket = sockets.get(id);
+    if (type === DATA) socket?.write(payload);
+    else if (type === END) socket?.end();
+  },
+  (error) => {
+    console.error(`bridge-peer: ${error.message}`);
+    process.exit(1);
+  },
+);
 
 // The job ended the bridge, or its `sandbox exec` went away.
 process.stdin.on("end", () => {
@@ -61,7 +68,7 @@ const server = createServer({ allowHalfOpen: true, noDelay: true }, (socket) => 
   };
   sockets.set(id, socket);
   send(encodeFrame(OPEN, id));
-  socket.on("data", (chunk: Buffer) => send(encodeFrame(DATA, id, chunk), socket));
+  socket.on("data", (chunk: Buffer) => send(encodeData(id, chunk), socket));
   socket.on("end", end);
   socket.on("error", () => {});
   socket.on("close", () => {

@@ -3,11 +3,16 @@
 // with stdin and stdout piped, turns each connection the shim accepts into a
 // Duplex for `onConnection` (the in-process gateway's `connect`), starts the
 // shim again if its exec ends, and stops it when the run is over.
+//
+// What arrives on the shim's stdout comes from the sandbox, so it is treated
+// as hostile: frames are capped, streams are capped, a stream id is used
+// once, and reading stops while the gateway is not keeping up. A shim that
+// breaks the protocol is killed, and started again only a few times a minute.
 
 import { Duplex, type Readable, type Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
-import { DATA, END, OPEN, encodeFrame, readFrames } from "./frames.ts";
+import { DATA, END, OPEN, encodeData, encodeFrame, readFrames } from "./frames.ts";
 
 /** A running shim's stdio, from `sandbox exec <id> -- node <shim> <port>` or anything like it. */
 export type BridgeProcess = {
@@ -31,8 +36,12 @@ export type StartBridgeOptions = {
   command?: string[];
   /** How long a shim has to print READY. Default 15 s. */
   readyTimeoutMs?: number;
-  /** Wait before starting a shim again, doubled per failure up to 5 s. Default 250 ms. */
+  /** Wait before the first restart, doubled for each restart in the last minute. Default 250 ms. */
   restartMs?: number;
+  /** Restarts allowed in any minute; past it the bridge stays down. Default 10. */
+  maxRestartsPerMinute?: number;
+  /** Streams open at once; one more is a protocol error. Default 64. */
+  maxStreams?: number;
   log?: (message: string) => void;
 };
 
@@ -57,53 +66,88 @@ export function defaultShimCommand(): string[] {
 }
 
 /** One shim's streams: each connection the shim accepted, by its id. */
-function attach(child: BridgeProcess, onConnection: (stream: Duplex) => void) {
+function attach(
+  child: BridgeProcess,
+  onConnection: (stream: Duplex) => void,
+  maxStreams: number,
+  violate: (reason: string) => void,
+) {
   const streams = new Map<number, Duplex>();
+  // Streams whose reader is behind; the shim's stdout is paused while any is.
+  const behind = new Set<number>();
+  const used = new Set<number>();
+  const shimEnded = new Set<number>();
   let dead = false;
   const write = (frame: Buffer, done?: (error?: Error | null) => void) => {
     if (dead) return done?.(new Error("The bridge's shim has stopped"));
     child.stdin.write(frame, done);
   };
+  const caughtUp = (id: number) => {
+    if (behind.delete(id) && behind.size === 0 && !dead) child.stdout.resume();
+  };
+  const stop = (reason?: string) => {
+    if (dead) return;
+    dead = true;
+    child.stdout.pause();
+    for (const stream of streams.values()) stream.destroy();
+    streams.clear();
+    behind.clear();
+    if (reason) violate(reason);
+  };
 
-  readFrames(child.stdout, (type, id, payload) => {
-    if (type === OPEN) {
-      let ended = false;
-      const stream = new Duplex({
-        allowHalfOpen: true,
-        read() {},
-        write(chunk: Buffer, _encoding, done) {
-          write(encodeFrame(DATA, id, chunk), done);
-        },
-        final(done) {
-          ended = true;
-          write(encodeFrame(END, id));
-          done();
-        },
-        destroy(error, done) {
-          if (!ended) write(encodeFrame(END, id));
-          ended = true;
-          streams.delete(id);
-          done(error);
-        },
-      });
-      streams.set(id, stream);
-      onConnection(stream);
-    } else if (type === DATA) {
-      streams.get(id)?.push(payload);
-    } else if (type === END) {
-      streams.get(id)?.push(null);
-    }
-  });
+  readFrames(
+    child.stdout,
+    (type, id, payload) => {
+      if (dead) return;
+      if (type === OPEN) {
+        if (id === 0 || used.has(id)) return stop(`the shim reused stream ${id}`);
+        if (streams.size >= maxStreams) return stop(`the shim opened more than ${maxStreams} streams`);
+        used.add(id);
+        let ended = false;
+        const stream = new Duplex({
+          allowHalfOpen: true,
+          read() {
+            caughtUp(id);
+          },
+          write(chunk: Buffer, _encoding, done) {
+            write(encodeData(id, chunk), done);
+          },
+          final(done) {
+            ended = true;
+            write(encodeFrame(END, id));
+            done();
+          },
+          destroy(error, done) {
+            if (!ended) write(encodeFrame(END, id));
+            ended = true;
+            streams.delete(id);
+            caughtUp(id);
+            done(error);
+          },
+        });
+        streams.set(id, stream);
+        onConnection(stream);
+      } else if (type === DATA || type === END) {
+        // A stream already closed on this side, or ended by the shim, may still
+        // get a frame or two; they are dropped, never pushed after the end.
+        const stream = streams.get(id);
+        if (!stream || stream.destroyed || stream.readableEnded || shimEnded.has(id)) return;
+        if (type === END) {
+          shimEnded.add(id);
+          stream.push(null);
+        } else if (!stream.push(payload) && !behind.has(id)) {
+          behind.add(id);
+          child.stdout.pause();
+        }
+      } else {
+        stop(`the shim sent a frame of unknown type ${type}`);
+      }
+    },
+    (error) => stop(error.message),
+  );
   child.stdin.on("error", () => {});
 
-  return {
-    streams,
-    stop: () => {
-      dead = true;
-      for (const stream of streams.values()) stream.destroy();
-      streams.clear();
-    },
-  };
+  return { streams, stop: () => stop() };
 }
 
 /** Starts the shim and resolves once it listens in the sandbox. */
@@ -111,18 +155,26 @@ export async function startBridge(options: StartBridgeOptions): Promise<Bridge> 
   const command = [...(options.command ?? defaultShimCommand()), String(options.port)];
   const readyTimeoutMs = options.readyTimeoutMs ?? 15_000;
   const restartMs = options.restartMs ?? 250;
+  const maxRestarts = options.maxRestartsPerMinute ?? 10;
+  const maxStreams = options.maxStreams ?? 64;
   const log = options.log ?? (() => {});
   let closed = false;
   let restarts = 0;
-  // Shims in a row that never got ready, for the backoff.
-  let failures = 0;
+  // When recent restarts happened, for the backoff and the cap.
+  let recent: number[] = [];
   let current: (ReturnType<typeof attach> & { child: BridgeProcess }) | null = null;
   let timer: NodeJS.Timeout | undefined;
 
   /** Starts one shim; resolves when it is ready, rejects (and kills it) if it is not. */
   const launch = (): Promise<void> => {
     const child = options.open(command);
-    const link = { child, ...attach(child, options.onConnection) };
+    const link = {
+      child,
+      ...attach(child, options.onConnection, maxStreams, (reason) => {
+        log(`bridge shim killed: ${reason}`);
+        child.kill();
+      }),
+    };
     current = link;
     let stderr = "";
     let exited = false;
@@ -133,7 +185,14 @@ export async function startBridge(options: StartBridgeOptions): Promise<Bridge> 
       if (current === link) current = null;
       if (closed) return;
       log(`bridge shim ended: ${stderr.trim().split("\n").at(-1) ?? ""}`);
-      const delayMs = Math.min(restartMs * 2 ** failures, 5_000);
+      const now = Date.now();
+      recent = recent.filter((at) => now - at < 60_000);
+      if (recent.length >= maxRestarts) {
+        log(`bridge shim restarted ${recent.length} times in a minute; not starting it again`);
+        return;
+      }
+      const delayMs = Math.min(restartMs * 2 ** recent.length, 5_000);
+      recent.push(now);
       timer = setTimeout(() => {
         if (closed) return;
         restarts += 1;
@@ -149,7 +208,6 @@ export async function startBridge(options: StartBridgeOptions): Promise<Bridge> 
         if (settled) return;
         settled = true;
         clearTimeout(timeout);
-        failures += 1;
         if (!exited) child.kill();
         reject(new Error(`${message}: ${stderr.trim()}`));
       };
@@ -163,7 +221,6 @@ export async function startBridge(options: StartBridgeOptions): Promise<Bridge> 
         if (!settled && stderr.includes(`READY ${options.port}`)) {
           settled = true;
           clearTimeout(timeout);
-          failures = 0;
           resolve();
         }
       });
