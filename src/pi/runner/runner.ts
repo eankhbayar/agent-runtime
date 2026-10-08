@@ -10,6 +10,8 @@
 //   THINKING_LEVEL    default high
 //   LLM_BASE_URL      optional; the egress gateway
 //   LLM_API_KEY       a run token or a placeholder the egress proxy replaces
+//   LLM_API           optional: openai or anthropic, for a model outside pi's
+//                     catalog; see model-config.ts for it and the LLM_* it reads
 //   RUN_LIMITS        optional JSON {wallClockMs, cpus, memoryMb}, echoed in
 //                     run_started so the trace can show usage against them
 //
@@ -30,6 +32,7 @@ import {
 
 import type { EmitRunEvent } from "../../contract/events.ts";
 import { createEmitter, forwardSessionEvent } from "./events.ts";
+import { registerModel, resolveModelConfig } from "./model-config.ts";
 
 export const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
 
@@ -48,7 +51,7 @@ export type RunnerOptions = {
   customTools?: (ctx: RunnerContext) => ToolDefinition[];
   /** pi's built-in tools to enable. Default: all of `BUILTIN_TOOLS`. */
   builtinTools?: readonly string[];
-  /** Used when LLM_PROVIDER and LLM_MODEL are not set. */
+  /** Used when LLM_PROVIDER and LLM_MODEL are not set (and LLM_API is not). */
   defaultModel: { provider: string; model: string };
   /** Extra `--check` probes; what it returns is added to the check notice. */
   check?: (ctx: RunnerContext) => Promise<Record<string, unknown>>;
@@ -72,8 +75,8 @@ async function run(options: RunnerOptions, emit: EmitRunEvent): Promise<void> {
   const workspace = env.WORKSPACE ?? "/workspace";
   const outputsDir = path.join(workspace, "outputs");
   const agentDir = path.join(workspace, ".pi");
-  const providerId = env.LLM_PROVIDER ?? options.defaultModel.provider;
-  const modelId = env.LLM_MODEL ?? options.defaultModel.model;
+  const modelConfig = resolveModelConfig(env, options.defaultModel);
+  const { provider: providerId, model: modelId } = modelConfig;
   const thinkingLevel = (env.THINKING_LEVEL ?? "high") as "low" | "medium" | "high";
   const ctx: RunnerContext = { workspace, outputsDir, emit, env };
 
@@ -82,6 +85,7 @@ async function run(options: RunnerOptions, emit: EmitRunEvent): Promise<void> {
     authPath: path.join(agentDir, "auth.json"),
     modelsPath: path.join(agentDir, "models.json"),
   });
+  registerModel(modelRuntime, modelConfig);
   const catalogModel = modelRuntime.getModel(providerId, modelId);
 
   if (argv.includes("--check")) {
@@ -89,6 +93,14 @@ async function run(options: RunnerOptions, emit: EmitRunEvent): Promise<void> {
       kind: "check",
       node: process.version,
       model: catalogModel ? `${catalogModel.provider}/${catalogModel.id}` : null,
+      ...(modelConfig.kind === "custom"
+        ? {
+            api: modelConfig.api,
+            baseUrl: modelConfig.baseUrl,
+            contextWindow: modelConfig.contextWindow,
+            maxTokens: modelConfig.maxTokens,
+          }
+        : {}),
       ...(await options.check?.(ctx)),
     });
     if (!catalogModel) throw new Error(`Model ${providerId}/${modelId} not in pi's catalog`);
@@ -99,7 +111,11 @@ async function run(options: RunnerOptions, emit: EmitRunEvent): Promise<void> {
   if (!prompt) throw new Error("PROMPT is required");
   if (!catalogModel) throw new Error(`Model ${providerId}/${modelId} not in pi's catalog`);
   if (env.LLM_API_KEY) await modelRuntime.setRuntimeApiKey(providerId, env.LLM_API_KEY);
-  const model = env.LLM_BASE_URL ? { ...catalogModel, baseUrl: env.LLM_BASE_URL } : catalogModel;
+  // A custom model already carries its base URL.
+  const model =
+    modelConfig.kind === "catalog" && env.LLM_BASE_URL
+      ? { ...catalogModel, baseUrl: env.LLM_BASE_URL }
+      : catalogModel;
 
   // No discovery: no AGENTS.md, skills, extensions or prompt templates from
   // the image or the workspace can change the agent's instructions.
