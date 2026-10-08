@@ -194,3 +194,47 @@ describe("executeRun with a mounted directory", () => {
     expect(provider.creates[0]).not.toHaveProperty("binds");
   });
 });
+
+/** Copies out symlinks, as `docker cp` does, to see that executeRun never follows them. */
+class LinkingProvider extends FakeSandboxProvider {
+  private readonly target: string;
+
+  constructor(run: FakeRun, target: string) {
+    super(run);
+    this.target = target;
+  }
+
+  override async download(_sandboxId: string, remotePath: string, localPath: string): Promise<void> {
+    this.calls.push(`download ${remotePath}`);
+    const { symlink } = await import("node:fs/promises");
+    await symlink(this.target, path.join(localPath, path.posix.basename(remotePath)));
+  }
+}
+
+describe("executeRun copying out of any sandbox", () => {
+  it("stores no output, and saves no session, that is a symlink", async () => {
+    const secret = path.join(await mkdtemp(path.join(tmpdir(), "agent-runtime-secret-")), "key");
+    await writeFile(secret, "sk-live-secret\n");
+    const store = new MemoryStore();
+    const provider = new LinkingProvider(
+      {
+        chunkMs: 2,
+        stdout: [
+          line(0, "artifact", { path: "/workspace/outputs/leak.txt", kind: "report", caption: "" }),
+          line(1, "run_finished", { status: "succeeded" }),
+        ],
+      },
+      secret,
+    );
+    const { sink, outcome } = start(provider, store);
+    const result = await outcome;
+    expect(sink.uploads).toEqual([]);
+    expect(result.session?.saved).toBe(false);
+
+    const sessions = await mkdtemp(path.join(tmpdir(), "agent-runtime-all-sessions-"));
+    await writeFile(path.join(sessions, "other.jsonl"), "other thread\n");
+    const dirLink = new LinkingProvider(ANSWER, sessions);
+    expect((await start(dirLink, store).outcome).session?.saved).toBe(false);
+    expect(store.saved.size).toBe(0);
+  });
+});

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { createServer, request } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createInProcessGateway } from "../../core/gateway.ts";
 import { createFakeSandboxCli, type FakeSandboxCli } from "../../testing/fake-sandbox.ts";
 import { startFakeUpstream } from "../../testing/fake-upstream.ts";
-import { CloudRunSandboxProvider, type CloudRunSandboxOptions } from "./cloud-run-provider.ts";
+import { CloudRunSandboxProvider, exposedMounts, type CloudRunSandboxOptions } from "./cloud-run-provider.ts";
 
 const LIMITS = { cpus: 1, memoryMb: 512, pids: 64 };
 
@@ -280,5 +280,59 @@ describe("CloudRunSandboxProvider", { timeout: 30_000 }, () => {
     } finally {
       await p.destroy(id);
     }
+  });
+});
+
+describe("CloudRunSandboxProvider, guarding the job", { timeout: 30_000 }, () => {
+  it("runs the CLI with PATH and HOME, not the job's environment", async () => {
+    process.env.AGENT_RUNTIME_TEST_SECRET = "job-secret";
+    try {
+      const p = provider({ cliEnv: { EXTRA: "1" } });
+      const id = await p.create({ image: "", limits: LIMITS });
+      await run(p, id, ["true"]);
+      await p.destroy(id);
+      for (const names of await cli.cliEnvNames()) {
+        expect(names.filter((n) => !["PWD", "SHLVL", "_", "__CF_USER_TEXT_ENCODING"].includes(n)).sort()).toEqual([
+          "EXTRA",
+          "HOME",
+          "PATH",
+        ]);
+      }
+    } finally {
+      delete process.env.AGENT_RUNTIME_TEST_SECRET;
+    }
+  });
+
+  it("fails an upload it could not pack, and a download over its cap", async () => {
+    const p = provider({ maxDownloadBytes: 4_000 });
+    const id = await p.create({ image: "", limits: LIMITS });
+    await expect(p.upload(id, "/no/such/dir", "/tmp/x")).rejects.toThrow("Could not pack /no/such/dir");
+    await run(p, id, ["sh", "-c", "head -c 100000 /dev/zero > /workspace/big"]);
+    const out = await mkdtemp(path.join(tmpdir(), "agent-runtime-download-"));
+    await expect(p.download(id, "/workspace/big", out)).rejects.toThrow(/larger than|more than/);
+  });
+
+  it("keeps a sandbox's workspace, and lists it, when deleting it failed", async () => {
+    const failing = path.join(path.dirname(cli.bin), "failing-delete");
+    await writeFile(failing, `#!/bin/sh\n[ "$1" = delete ] && { echo "Error: boom" >&2; exit 1; }\nexec ${JSON.stringify(cli.bin)} "$@"\n`);
+    await chmod(failing, 0o755);
+    const p = provider({ sandboxBin: failing });
+    const id = await p.create({ image: "", limits: LIMITS });
+    await expect(p.destroy(id)).rejects.toThrow("boom");
+    expect(await stat(path.join(cli.stateDir, id, "workspace")).catch(() => null)).not.toBeNull();
+    expect((await p.list()).map((s) => s.sandboxId)).toEqual([id]);
+  });
+
+  it("refuses to start a sandbox that could read a mounted volume nobody hid", () => {
+    const table = [
+      "overlay / overlay rw 0 0",
+      "agent-sessions /sessions fuse rw,nosuid 0 0",
+      "agent-data /snap\\040shots fuse.gcsfuse ro 0 0",
+      "proc /proc proc rw 0 0",
+    ].join("\n");
+    expect(exposedMounts(table, [])).toEqual(["/sessions", "/snap shots"]);
+    expect(exposedMounts(table, ["/sessions", "/snap shots"])).toEqual([]);
+    expect(exposedMounts(table, ["/"])).toEqual([]);
+    expect(exposedMounts(table, ["/sess"])).toEqual(["/sessions", "/snap shots"]);
   });
 });

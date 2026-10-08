@@ -21,11 +21,13 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { chmod, cp, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import { chmod, mkdir, mkdtemp, open, readFile, rm, truncate } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import path from "node:path";
 import type { Duplex } from "node:stream";
 
+import { extractPlainTar } from "../../core/plain-files.ts";
 import type {
   BindMount,
   ExecHandle,
@@ -42,6 +44,8 @@ import { ExitMarkerReader, newExitMarker, printExitMarker, splitExitMarker } fro
 export const SANDBOX_BIN = "/usr/local/gcp/bin/sandbox";
 
 const DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+/** The most a CLI call's output is held in memory; a download goes to disk instead. */
+const MAX_CLI_OUTPUT = 16 * 1024 * 1024;
 /** Linux refuses a single argument or environment string longer than this. */
 const MAX_ARG_BYTES = 128 * 1024 - 1;
 
@@ -92,6 +96,16 @@ export type CloudRunSandboxOptions = {
    */
   hide?: string[];
   /**
+   * FUSE mounts of the job (a Cloud Storage volume is one) that sandboxes may
+   * read. `create` refuses to start a sandbox while the job has any other
+   * FUSE mount that `hide` does not cover, since the sandbox could read it.
+   */
+  visibleMounts?: string[];
+  /** The most `download` takes out of a sandbox. Default 512 MiB. */
+  maxDownloadBytes?: number;
+  /** Environment for the CLI itself, which gets only PATH and HOME otherwise. */
+  cliEnv?: Record<string, string>;
+  /**
    * Added to the run's memory limit to make the `ulimit -v` address-space cap
    * (Node reserves about 1.4 GiB of address space before it allocates
    * anything). Default 1536 MiB. `false` sets no memory limit.
@@ -134,12 +148,29 @@ function mountSpec(bind: Bind): string {
   return `type=bind,source=${bind.source},destination=${bind.destination}${bind.readonly ? ",readonly" : ""}`;
 }
 
+/**
+ * The FUSE mounts (a Cloud Storage volume is one) in a `/proc/self/mounts`
+ * table that no path in `covered` contains.
+ */
+export function exposedMounts(table: string, covered: readonly string[]): string[] {
+  return table
+    .split("\n")
+    .map((line) => line.split(" "))
+    .filter(([, , type]) => type?.startsWith("fuse"))
+    .map(([, point]) =>
+      point!.replace(/\\([0-7]{3})/g, (_, code: string) => String.fromCharCode(Number.parseInt(code, 8))),
+    )
+    .filter((point) => !covered.some((dir) => isWithin(dir, point)));
+}
+
 export class CloudRunSandboxProvider implements SandboxProvider {
   private readonly opts: CloudRunSandboxOptions;
   private readonly bin: string;
   private readonly stateDir: string;
   private readonly workspace: string;
   private readonly sandboxes = new Map<string, Sandbox>();
+
+  private mountsChecked = false;
 
   constructor(opts: CloudRunSandboxOptions) {
     this.opts = opts;
@@ -164,6 +195,7 @@ export class CloudRunSandboxProvider implements SandboxProvider {
     binds?: BindMount[];
   }): Promise<string> {
     // `image` is not used: the sandbox's root is this job's own image.
+    await this.checkMounts();
     const id = `${this.opts.namespace}-sbx-${randomBytes(6).toString("hex")}`;
     const root = path.join(this.stateDir, id);
     const workspace = path.join(root, "workspace");
@@ -219,54 +251,72 @@ export class CloudRunSandboxProvider implements SandboxProvider {
   }
 
   async upload(sandboxId: string, localDir: string, remoteDir: string): Promise<void> {
-    // Into the workspace the job shares with the sandbox, or through tar on stdin.
-    // Either way the agent, root in its sandbox, can change what it is given.
-    const shared = this.jobPath(sandboxId, remoteDir, true);
-    if (shared) {
-      await cp(localDir, shared, { recursive: true, force: true });
-      return;
-    }
+    // Unpacked by tar inside the sandbox, never written through the shared
+    // workspace from here: a symlink the sandbox made there would point the
+    // job's write at the job's own files. The agent, root in its sandbox, can
+    // change what it is given.
     const marker = newExitMarker();
     const script = `mkdir -p "$1" && tar -xf - -C "$1" --no-same-owner; code=$?; ${printExitMarker(marker)}`;
     const packed = spawn("tar", ["-C", localDir, "-cf", "-", "."], {
       stdio: ["ignore", "pipe", "pipe"],
+      env: { ...this.cliEnvironment(), COPYFILE_DISABLE: "1" },
+    });
+    let packError = "";
+    packed.stderr.setEncoding("utf8").on("data", (d: string) => (packError = `${packError}${d}`.slice(-2_000)));
+    const packedExit = new Promise<number | null>((resolve) => {
+      packed.on("error", (error) => {
+        packError += String(error);
+        resolve(null);
+      });
+      packed.on("close", (code) => resolve(code));
     });
     const result = await this.cli(this.execArgs(sandboxId, ["/bin/sh", "-c", script, "sh", remoteDir]), {
       input: packed.stdout,
       check: false,
     });
+    const packedCode = await packedExit;
+    if (packedCode !== 0) throw new Error(`Could not pack ${localDir} (${packedCode}): ${packError.trim()}`);
     const code = splitExitMarker(result.stdout, marker).code;
     if (code !== 0) {
       throw new Error(`Could not upload ${localDir} to ${remoteDir} (${code ?? "no exit code"}): ${result.stderr.trim()}`);
     }
   }
 
+  /**
+   * Packed by tar inside the sandbox, where a symlink resolves in the
+   * sandbox's own view and so cannot reach a hidden path or the job's files,
+   * and unpacked here as directories and regular files only.
+   */
   async download(sandboxId: string, remotePath: string, localPath: string): Promise<void> {
-    const target = path.join(localPath, path.posix.basename(remotePath));
-    const shared = this.jobPath(sandboxId, remotePath, false);
-    if (shared) {
-      await stat(shared);
-      await cp(shared, target, { recursive: true });
-      return;
-    }
+    const max = this.opts.maxDownloadBytes ?? 512 * 1024 * 1024;
     const marker = newExitMarker();
     const script = `cd "$(dirname "$1")" && tar -cf - "$(basename "$1")"; code=$?; ${printExitMarker(marker)}`;
-    const result = await this.cli(this.execArgs(sandboxId, ["/bin/sh", "-c", script, "sh", remotePath]), {
-      check: false,
-    });
-    const { body, code } = splitExitMarker(result.stdout, marker);
-    if (code !== 0) {
-      throw new Error(`Could not download ${remotePath} (${code ?? "no exit code"}): ${result.stderr.trim()}`);
-    }
     const dir = await mkdtemp(path.join(tmpdir(), "agent-runtime-download-"));
     try {
       const archive = path.join(dir, "download.tar");
-      await writeFile(archive, body);
-      await new Promise<void>((resolve, reject) => {
-        const child = spawn("tar", ["-xf", archive, "-C", localPath], { stdio: "ignore" });
-        child.on("error", reject);
-        child.on("close", (exit) => (exit === 0 ? resolve() : reject(new Error(`tar -x exited ${exit}`))));
-      });
+      const { stderr } = await this.cliToFile(
+        this.execArgs(sandboxId, ["/bin/sh", "-c", script, "sh", remotePath], { COPYFILE_DISABLE: "1" }),
+        archive,
+        max + 4096,
+      );
+      // The marker ends the output; read it from the tail and cut it off.
+      const handle = await open(archive, "r");
+      let size: number;
+      let tail: Buffer;
+      try {
+        size = (await handle.stat()).size;
+        const length = Math.min(size, 256);
+        tail = Buffer.alloc(length);
+        await handle.read(tail, 0, length, size - length);
+      } finally {
+        await handle.close();
+      }
+      const { body, code } = splitExitMarker(tail, marker);
+      if (code !== 0) {
+        throw new Error(`Could not download ${remotePath} (${code ?? "no exit code"}): ${stderr.trim()}`);
+      }
+      await truncate(archive, size - (tail.length - body.length));
+      await extractPlainTar(archive, localPath, max);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -293,7 +343,7 @@ export class CloudRunSandboxProvider implements SandboxProvider {
       child = spawn(
         this.bin,
         this.execArgs(sandboxId, ["/bin/sh", "-c", script, "sh", pidFile, ...command], opts.env),
-        { stdio: ["ignore", "pipe", "pipe"] },
+        { stdio: ["ignore", "pipe", "pipe"], env: this.cliEnvironment() },
       );
     } catch (error) {
       return { done: Promise.reject(error), kill: async () => {} };
@@ -356,6 +406,7 @@ export class CloudRunSandboxProvider implements SandboxProvider {
   openStream(sandboxId: string, command: string[]): BridgeProcess {
     const child = spawn(this.bin, this.execArgs(sandboxId, command), {
       stdio: ["pipe", "pipe", "pipe"],
+      env: this.cliEnvironment(),
     });
     const exited = new Promise<void>((resolve) => {
       child.on("close", () => resolve());
@@ -394,14 +445,12 @@ export class CloudRunSandboxProvider implements SandboxProvider {
   async destroy(sandboxId: string): Promise<void> {
     const sandbox = this.sandboxes.get(sandboxId);
     await sandbox?.bridge?.close().catch(() => {});
-    try {
-      // Deleting a missing sandbox succeeds, so any other failure is real.
-      await this.cli(["delete", sandboxId, "--force"]);
-    } finally {
-      for (const child of sandbox?.children ?? []) child.kill("SIGTERM");
-      if (sandbox) await rm(sandbox.root, { recursive: true, force: true }).catch(() => {});
-      this.sandboxes.delete(sandboxId);
-    }
+    // Deleting a missing sandbox succeeds, so any other failure is real, and
+    // the sandbox may still be using its workspace: keep it, and keep it listed.
+    await this.cli(["delete", sandboxId, "--force"]);
+    for (const child of sandbox?.children ?? []) child.kill("SIGTERM");
+    if (sandbox) await rm(sandbox.root, { recursive: true, force: true }).catch(() => {});
+    this.sandboxes.delete(sandboxId);
   }
 
   async status(sandboxId: string): Promise<SandboxStatus> {
@@ -476,17 +525,32 @@ export class CloudRunSandboxProvider implements SandboxProvider {
     return lines;
   }
 
-  /** The job's path for a path inside a sandbox's bind, or null when it is in no bind. */
-  private jobPath(sandboxId: string, remotePath: string, writable: boolean): string | null {
-    const sandbox = this.sandboxes.get(sandboxId);
-    if (!sandbox) return null;
-    for (const bind of sandbox.binds) {
-      if (writable && bind.readonly) continue;
-      if (isWithin(bind.destination, remotePath)) {
-        return path.join(bind.source, path.posix.relative(bind.destination, remotePath));
+  /** The environment the CLI runs with: PATH, HOME and `cliEnv`, none of the job's secrets. */
+  private cliEnvironment(): Record<string, string> {
+    return {
+      PATH: process.env.PATH ?? DEFAULT_PATH,
+      HOME: process.env.HOME ?? "/root",
+      ...this.opts.cliEnv,
+    };
+  }
+
+  /**
+   * Refuses to start a sandbox while the job has a FUSE mount (a Cloud
+   * Storage volume) that neither `hide` nor `visibleMounts` names: the
+   * sandbox's root is the job's filesystem, so it could read the volume.
+   */
+  private async checkMounts(): Promise<void> {
+    if (this.mountsChecked) return;
+    const table = await readFile("/proc/self/mounts", "utf8").catch(() => null);
+    if (table !== null) {
+      const exposed = exposedMounts(table, [...(this.opts.hide ?? []), ...(this.opts.visibleMounts ?? [])]);
+      if (exposed.length > 0) {
+        throw new Error(
+          `Sandboxes would see the job's mounted ${exposed.join(", ")}; add each to hide, or to visibleMounts if they may`,
+        );
       }
     }
-    return null;
+    this.mountsChecked = true;
   }
 
   /** Signals a command started by `exec`, waiting briefly for its pid file. */
@@ -517,24 +581,73 @@ export class CloudRunSandboxProvider implements SandboxProvider {
     return new Promise((resolve, reject) => {
       const child = spawn(this.bin, args, {
         stdio: [options.input ? "pipe" : "ignore", "pipe", "pipe"],
+        env: this.cliEnvironment(),
       });
       const stdout: Buffer[] = [];
+      let size = 0;
+      let overflow = false;
       let stderr = "";
       // Piped above; the union-typed stdio hides that from the spawn overloads.
-      child.stdout!.on("data", (d: Buffer) => stdout.push(d));
-      child.stderr!.setEncoding("utf8").on("data", (d: string) => (stderr += d));
+      child.stdout!.on("data", (d: Buffer) => {
+        size += d.length;
+        if (size > MAX_CLI_OUTPUT) {
+          overflow = true;
+          child.kill("SIGKILL");
+        } else {
+          stdout.push(d);
+        }
+      });
+      child.stderr!.setEncoding("utf8").on("data", (d: string) => (stderr = `${stderr}${d}`.slice(-16_384)));
       if (options.input && child.stdin) {
         child.stdin.on("error", () => {});
         options.input.pipe(child.stdin);
       }
       child.on("error", reject);
       child.on("close", (code, signal) => {
+        if (overflow) {
+          reject(new Error(`sandbox ${args[0]} wrote more than ${MAX_CLI_OUTPUT} bytes`));
+          return;
+        }
         const result = { code, signal, stdout: Buffer.concat(stdout), stderr };
         if (options.check !== false && code !== 0) {
           reject(new SandboxCliError(args, code, signal, stderr));
         } else {
           resolve(result);
         }
+      });
+    });
+  }
+
+  /** Runs the CLI with its stdout going to `file`, killing it past `maxBytes`. */
+  private cliToFile(args: string[], file: string, maxBytes: number): Promise<{ stderr: string }> {
+    return new Promise((resolve, reject) => {
+      const child = spawn(this.bin, args, { stdio: ["ignore", "pipe", "pipe"], env: this.cliEnvironment() });
+      const out = createWriteStream(file, { flags: "wx" });
+      let size = 0;
+      let overflow = false;
+      let stderr = "";
+      child.stdout.on("data", (d: Buffer) => {
+        size += d.length;
+        if (size > maxBytes) {
+          overflow = true;
+          child.kill("SIGKILL");
+        }
+      });
+      child.stdout.pipe(out);
+      child.stderr.setEncoding("utf8").on("data", (d: string) => (stderr = `${stderr}${d}`.slice(-16_384)));
+      child.on("error", reject);
+      const written = new Promise<void>((done, fail) => {
+        out.on("finish", done);
+        out.on("error", fail);
+      });
+      child.on("close", () => {
+        written.then(
+          () =>
+            overflow
+              ? reject(new Error(`The download is larger than ${maxBytes} bytes`))
+              : resolve({ stderr }),
+          reject,
+        );
       });
     });
   }

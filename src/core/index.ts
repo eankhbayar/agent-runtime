@@ -6,3 +6,4 @@ export * from "./print-events.ts";
 export * from "./session-store.ts";
 export * from "./gateway-handler.ts";
 export * from "./gateway.ts";
+export * from "./plain-files.ts";

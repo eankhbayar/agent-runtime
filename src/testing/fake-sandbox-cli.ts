@@ -37,6 +37,10 @@ if (!root) {
 const argv = process.argv.slice(2);
 mkdirSync(root, { recursive: true });
 appendFileSync(path.join(root, "calls.jsonl"), `${JSON.stringify(argv)}\n`);
+appendFileSync(
+  path.join(root, "env.jsonl"),
+  `${JSON.stringify(Object.keys(process.env).filter((name) => name !== "FAKE_SANDBOX_ROOT"))}\n`,
+);
 
 type Bind = { source: string; destination: string; readonly: boolean };
 type Config = { id: string; binds: Bind[]; flags: string[] };

@@ -75,7 +75,7 @@ describe("DirectorySessionStore", () => {
     const root = await temp("store");
     await writeFile(path.join(root, "thread_1.tar"), "not a tar file");
     await expect(new DirectorySessionStore(root).restore("thread_1", await temp("into"))).rejects.toThrow(
-      "tar failed",
+      "the archive ends early",
     );
   });
 

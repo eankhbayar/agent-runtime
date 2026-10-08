@@ -5,8 +5,13 @@
 
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdir, rename, rm, stat } from "node:fs/promises";
+import { lstat, mkdir, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
+
+import { assertPlainTree, extractPlainTar } from "./plain-files.ts";
+
+/** The most a stored session may hold. */
+const MAX_SESSION_BYTES = 256 * 1024 * 1024;
 
 /**
  * Where sessions are kept, by key (usually the thread). Both sides are local
@@ -39,7 +44,11 @@ export function sessionFileName(key: string): string {
 
 function tar(args: string[], tarPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn(tarPath, args, { stdio: ["ignore", "ignore", "pipe"] });
+    // COPYFILE_DISABLE keeps macOS tar from adding ._ files for extended attributes.
+    const child = spawn(tarPath, args, {
+      stdio: ["ignore", "ignore", "pipe"],
+      env: { ...process.env, COPYFILE_DISABLE: "1" },
+    });
     let stderr = "";
     child.stderr.setEncoding("utf8").on("data", (d: string) => (stderr += d));
     child.on("error", reject);
@@ -60,7 +69,9 @@ export type DirectorySessionStoreOptions = {
  * file and renames it over the key's, which replaces the object whole, so a
  * restore reads one save or another, never a mix. Two runs of the same key
  * that end together both save; the last rename wins and the other's turns are
- * lost from the session, so a thread should not run twice at once.
+ * lost from the session, so a thread should not run twice at once. A save
+ * refuses a directory holding anything but directories and regular files, and
+ * a restore creates nothing else.
  */
 export class DirectorySessionStore implements SessionStore {
   readonly rootDir: string;
@@ -78,9 +89,11 @@ export class DirectorySessionStore implements SessionStore {
 
   async save(key: string, from: string): Promise<void> {
     const target = this.pathFor(key);
-    if (!(await stat(from).catch(() => null))?.isDirectory()) {
+    if (!(await lstat(from).catch(() => null))?.isDirectory()) {
       throw new Error(`No session directory at ${from}`);
     }
+    // Links would be archived as links, or followed into whatever they name.
+    await assertPlainTree(from, MAX_SESSION_BYTES);
     await mkdir(this.rootDir, { recursive: true });
     const temp = path.join(
       this.rootDir,
@@ -102,7 +115,8 @@ export class DirectorySessionStore implements SessionStore {
       throw error;
     });
     if (!found) return false;
-    await tar(["-xf", source, "-C", into, "--no-same-owner"], this.tarPath);
+    // Read as untrusted too: only directories and regular files come out.
+    await extractPlainTar(source, into, MAX_SESSION_BYTES);
     return true;
   }
 }

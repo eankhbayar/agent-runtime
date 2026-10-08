@@ -6,7 +6,7 @@
 // This file never calls docker, a store or the gateway directly.
 
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -20,6 +20,7 @@ import type {
 } from "../contract/events.ts";
 import { answerText, foldRunEvents } from "../contract/fold.ts";
 
+import { assertPlainTree, readPlainFile } from "./plain-files.ts";
 import type { BindMount, SampleUsage, SandboxProvider } from "./sandbox-provider.ts";
 import type { SessionStore } from "./session-store.ts";
 
@@ -154,6 +155,8 @@ const SAMPLES_PER_FLUSH = 5;
 const RETRIES = 4;
 const RETRY_MS = 250;
 const STDERR_TAIL = 2_000;
+/** The most an output, or a saved session, may be; anything larger is not stored. */
+export const MAX_OUTPUT_BYTES = 256 * 1024 * 1024;
 
 const MEDIA_TYPES: Record<string, string> = {
   ".csv": "text/csv",
@@ -271,10 +274,13 @@ async function saveSession(
       return false;
     }
     const dir = path.join(local, path.posix.basename(remoteDir));
-    if (!(await stat(dir).catch(() => null))?.isDirectory()) {
+    if (!(await stat(dir).catch(() => null))) {
       log(`no session to save at ${remoteDir}`);
       return false;
     }
+    // The sandbox wrote this. A symlink in it, or for it, would have the store
+    // archive whatever the job can reach there: every other thread's session.
+    await assertPlainTree(dir, MAX_OUTPUT_BYTES);
     await session.store.save(session.key, dir);
     return true;
   } catch (cause) {
@@ -528,10 +534,12 @@ async function upload(
   const remotePath = str(event.payload.path);
   if (!remotePath) return null;
   const fileName = path.posix.basename(remotePath);
+  let dir: string | undefined;
   try {
-    const dir = await mkdtemp(path.join(tmpdir(), "agent-runtime-output-"));
+    dir = await mkdtemp(path.join(tmpdir(), "agent-runtime-output-"));
     await opts.provider.download(sandboxId, remotePath, dir);
-    const bytes = await readFile(path.join(dir, fileName));
+    // Not followed: a symlink the agent made would hand over a job file instead.
+    const bytes = await readPlainFile(path.join(dir, fileName), MAX_OUTPUT_BYTES);
     return await opts.sink.artifact({
       fileName,
       kind: str(event.payload.kind) ?? "report",
@@ -545,6 +553,8 @@ async function upload(
     // A missing file must not lose the run: the event still lands, undownloaded.
     opts.sink.log(`could not store ${remotePath}: ${String(cause)}`);
     return null;
+  } finally {
+    if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 }
 

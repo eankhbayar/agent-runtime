@@ -18,6 +18,8 @@ export type FakeSandboxCli = {
   stateDir: string;
   /** The arguments of every call so far, oldest first. */
   calls: () => Promise<string[][]>;
+  /** The names in the CLI's own environment, for every call so far. */
+  cliEnvNames: () => Promise<string[][]>;
   /** Sandboxes the fake still has. */
   sandboxes: () => Promise<string[]>;
   /** The mounts and flags a sandbox was started with. */
@@ -52,6 +54,11 @@ export async function createFakeSandboxCli(): Promise<FakeSandboxCli> {
     stateDir,
     calls: async () =>
       (await readFile(path.join(root, "calls.jsonl"), "utf8").catch(() => ""))
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as string[]),
+    cliEnvNames: async () =>
+      (await readFile(path.join(root, "env.jsonl"), "utf8").catch(() => ""))
         .split("\n")
         .filter(Boolean)
         .map((line) => JSON.parse(line) as string[]),
