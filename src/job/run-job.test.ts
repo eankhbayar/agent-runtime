@@ -466,6 +466,72 @@ describe("runJob", () => {
     expect(result).toMatchObject({ kind: "finished", settled: true });
   });
 
+  it("waits only briefly for a beat in flight once shut down", async () => {
+    vi.useFakeTimers();
+    const store = new FakeRunStore({ run_1: {} });
+    // HKJC's interval, twice Cloud Run's grace before SIGKILL.
+    store.heartbeatMs = 20_000;
+    let beatStarted = false;
+    let returned = false;
+
+    const running = runJob(store, {
+      ...QUICK,
+      shutdownSignals: ["SIGUSR2"],
+      runId: "run_1",
+      work: async (claim, signal) => {
+        claim.heartbeat = () => {
+          beatStarted = true;
+          return new Promise(() => {});
+        };
+        await aborted(signal);
+        return { status: "cancelled" };
+      },
+    }).finally(() => (returned = true));
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(beatStarted).toBe(true);
+    process.emit("SIGUSR2", "SIGUSR2");
+
+    await vi.advanceTimersByTimeAsync(999);
+    expect(returned).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(returned).toBe(true);
+    expect(await running).toMatchObject({ kind: "finished", stopped: "shutdown", settled: true });
+  });
+
+  it("cuts the wait for a beat in flight short when a shutdown comes during it", async () => {
+    vi.useFakeTimers();
+    const store = new FakeRunStore({ run_1: {} });
+    store.heartbeatMs = 20_000;
+    let returned = false;
+    let beatStarted: () => void;
+    const started = new Promise<void>((resolve) => (beatStarted = resolve));
+
+    const running = runJob(store, {
+      ...QUICK,
+      shutdownSignals: ["SIGUSR2"],
+      shutdownBeatWaitMs: 500,
+      runId: "run_1",
+      work: async (claim) => {
+        claim.heartbeat = () => {
+          beatStarted();
+          return new Promise(() => {});
+        };
+        await started;
+        return { status: "succeeded" };
+      },
+    }).finally(() => (returned = true));
+    await vi.advanceTimersByTimeAsync(25_000);
+    expect(returned).toBe(false);
+    process.emit("SIGUSR2", "SIGUSR2");
+
+    await vi.advanceTimersByTimeAsync(500);
+    expect(returned).toBe(true);
+    // The work had already ended, so the shutdown did not stop it.
+    const result = await running;
+    expect(result).toMatchObject({ kind: "finished", ending: { status: "succeeded" } });
+    expect(result.kind === "finished" && result.stopped).toBeUndefined();
+  });
+
   it("stops the work as gone once no beat has got through for maxQuietMs", async () => {
     const store = new FakeRunStore({ run_1: {} });
     store.heartbeatMs = 2;
