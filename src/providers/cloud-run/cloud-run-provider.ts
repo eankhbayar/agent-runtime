@@ -97,10 +97,17 @@ export type CloudRunSandboxOptions = {
   hide?: string[];
   /**
    * FUSE mounts of the job (a Cloud Storage volume is one) that sandboxes may
-   * read. `create` refuses to start a sandbox while the job has any other
-   * FUSE mount that `hide` does not cover, since the sandbox could read it.
+   * read. Every other FUSE mount is covered like a `hide` path, so a volume
+   * the job mounts stays out of its sandboxes unless it is listed here.
    */
   visibleMounts?: string[];
+  /**
+   * The job's mount table, in `/proc/self/mounts` format. Read from
+   * `/proc/self/mounts` when omitted; tests pass one in.
+   */
+  mountTable?: string;
+  /** Where the provider says which mounts it covered. */
+  log?: (message: string) => void;
   /** The most `download` takes out of a sandbox. Default 512 MiB. */
   maxDownloadBytes?: number;
   /** Environment for the CLI itself, which gets only PATH and HOME otherwise. */
@@ -150,18 +157,24 @@ function mountSpec(bind: Bind): string {
 
 /**
  * The FUSE mounts (a Cloud Storage volume is one) in a `/proc/self/mounts`
- * table that no path in `covered` contains.
+ * table that no path in `covered` contains, with their filesystem types.
  */
-export function exposedMounts(table: string, covered: readonly string[]): string[] {
+export function uncoveredFuseMounts(table: string, covered: readonly string[]): { point: string; type: string }[] {
   return table
     .split("\n")
     .map((line) => line.split(" "))
     // fuse or fuse.<name> (gcsfuse); not fusectl, the control filesystem.
     .filter(([, , type]) => type === "fuse" || type?.startsWith("fuse."))
-    .map(([, point]) =>
-      point!.replace(/\\([0-7]{3})/g, (_, code: string) => String.fromCharCode(Number.parseInt(code, 8))),
-    )
-    .filter((point) => !covered.some((dir) => isWithin(dir, point)));
+    .map(([, point, type]) => ({
+      point: point!.replace(/\\([0-7]{3})/g, (_, code: string) => String.fromCharCode(Number.parseInt(code, 8))),
+      type: type!,
+    }))
+    .filter(({ point }) => !covered.some((dir) => isWithin(dir, point)));
+}
+
+/** The mount points `uncoveredFuseMounts` finds. */
+export function exposedMounts(table: string, covered: readonly string[]): string[] {
+  return uncoveredFuseMounts(table, covered).map(({ point }) => point);
 }
 
 export class CloudRunSandboxProvider implements SandboxProvider {
@@ -171,7 +184,7 @@ export class CloudRunSandboxProvider implements SandboxProvider {
   private readonly workspace: string;
   private readonly sandboxes = new Map<string, Sandbox>();
 
-  private mountsChecked = false;
+  private covered: Promise<string[]> | null = null;
 
   constructor(opts: CloudRunSandboxOptions) {
     this.opts = opts;
@@ -196,7 +209,7 @@ export class CloudRunSandboxProvider implements SandboxProvider {
     binds?: BindMount[];
   }): Promise<string> {
     // `image` is not used: the sandbox's root is this job's own image.
-    await this.checkMounts();
+    const covered = await this.coveredPaths();
     const id = `${this.opts.namespace}-sbx-${randomBytes(6).toString("hex")}`;
     const root = path.join(this.stateDir, id);
     const workspace = path.join(root, "workspace");
@@ -214,10 +227,11 @@ export class CloudRunSandboxProvider implements SandboxProvider {
       limits,
       bridge: null,
       children: new Set(),
+      // Covers first, so a workspace or data bind never lands under one.
       binds: [
+        ...covered.map((p) => ({ source: empty, destination: p, readonly: true })),
         { source: workspace, destination: this.workspace, readonly: false },
         ...binds.map((b) => ({ source: b.localDir, destination: b.remoteDir, readonly: true })),
-        ...(this.opts.hide ?? []).map((p) => ({ source: empty, destination: p, readonly: true })),
       ],
     };
     this.sandboxes.set(id, sandbox);
@@ -536,22 +550,23 @@ export class CloudRunSandboxProvider implements SandboxProvider {
   }
 
   /**
-   * Refuses to start a sandbox while the job has a FUSE mount (a Cloud
-   * Storage volume) that neither `hide` nor `visibleMounts` names: the
-   * sandbox's root is the job's filesystem, so it could read the volume.
+   * The paths every sandbox gets an empty read-only directory over: `hide`,
+   * plus each FUSE mount of the job (a Cloud Storage volume, or one of the
+   * platform's own such as Cloud Run's /var/log) that `visibleMounts` does
+   * not name. The sandbox's root is the job's filesystem, so it would
+   * otherwise read them. Worked out once per provider.
    */
-  private async checkMounts(): Promise<void> {
-    if (this.mountsChecked) return;
-    const table = await readFile("/proc/self/mounts", "utf8").catch(() => null);
-    if (table !== null) {
-      const exposed = exposedMounts(table, [...(this.opts.hide ?? []), ...(this.opts.visibleMounts ?? [])]);
-      if (exposed.length > 0) {
-        throw new Error(
-          `Sandboxes would see the job's mounted ${exposed.join(", ")}; add each to hide, or to visibleMounts if they may`,
-        );
+  private coveredPaths(): Promise<string[]> {
+    this.covered ??= (async () => {
+      const hide = this.opts.hide ?? [];
+      const table = this.opts.mountTable ?? (await readFile("/proc/self/mounts", "utf8").catch(() => ""));
+      const extra = uncoveredFuseMounts(table, [...hide, ...(this.opts.visibleMounts ?? [])]);
+      if (extra.length > 0) {
+        this.opts.log?.(`covering the job's FUSE mounts in sandboxes: ${extra.map((m) => `${m.point} (${m.type})`).join(", ")}`);
       }
-    }
-    this.mountsChecked = true;
+      return [...hide, ...extra.map((m) => m.point)];
+    })();
+    return this.covered;
   }
 
   /** Signals a command started by `exec`, waiting briefly for its pid file. */
@@ -636,7 +651,11 @@ export class CloudRunSandboxProvider implements SandboxProvider {
       });
       child.stdout.pipe(out);
       child.stderr.setEncoding("utf8").on("data", (d: string) => (stderr = `${stderr}${d}`.slice(-16_384)));
-      child.on("error", reject);
+      // A CLI that never started leaves nothing to close the file.
+      child.on("error", (error) => {
+        out.destroy();
+        reject(error);
+      });
       const written = new Promise<void>((done, fail) => {
         out.on("finish", done);
         out.on("error", fail);

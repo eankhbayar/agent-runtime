@@ -38,7 +38,11 @@ export type StartBridgeOptions = {
   readyTimeoutMs?: number;
   /** Wait before the first restart, doubled for each restart in the last minute. Default 250 ms. */
   restartMs?: number;
-  /** Restarts allowed in any minute; past it the bridge stays down. Default 10. */
+  /**
+   * Restarts allowed within a minute. Once a shim has been restarted this many
+   * times in a minute the bridge stays down for the rest of the sandbox's life.
+   * Default 10.
+   */
   maxRestartsPerMinute?: number;
   /** Streams open at once; one more is a protocol error. Default 64. */
   maxStreams?: number;
@@ -75,7 +79,8 @@ function attach(
   const streams = new Map<number, Duplex>();
   // Streams whose reader is behind; the shim's stdout is paused while any is.
   const behind = new Set<number>();
-  const used = new Set<number>();
+  // Ids only grow, so one number replaces a set of every id the shim used.
+  let lastId = 0;
   const shimEnded = new Set<number>();
   let dead = false;
   const write = (frame: Buffer, done?: (error?: Error | null) => void) => {
@@ -100,9 +105,9 @@ function attach(
     (type, id, payload) => {
       if (dead) return;
       if (type === OPEN) {
-        if (id === 0 || used.has(id)) return stop(`the shim reused stream ${id}`);
+        if (id <= lastId) return stop(`the shim reused stream ${id}`);
         if (streams.size >= maxStreams) return stop(`the shim opened more than ${maxStreams} streams`);
-        used.add(id);
+        lastId = id;
         let ended = false;
         const stream = new Duplex({
           allowHalfOpen: true,
@@ -121,6 +126,7 @@ function attach(
             if (!ended) write(encodeFrame(END, id));
             ended = true;
             streams.delete(id);
+            shimEnded.delete(id);
             caughtUp(id);
             done(error);
           },

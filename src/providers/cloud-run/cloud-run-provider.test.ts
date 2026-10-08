@@ -72,13 +72,38 @@ describe("CloudRunSandboxProvider", { timeout: 30_000 }, () => {
     expect(runCall.some((arg) => arg === "--publish" || arg === "-p")).toBe(false);
     const { binds } = await cli.config(id);
     expect(binds).toEqual([
+      // A sandbox's root is the job's filesystem, so what it must not read is
+      // covered over, first, so no bind of its own lands under a cover.
+      { source: path.join(cli.stateDir, id, "empty"), destination: sessions, readonly: true },
       { source: path.join(cli.stateDir, id, "workspace"), destination: "/workspace", readonly: false },
       { source: data, destination: "/data/snapshot", readonly: true },
-      // A sandbox's root is the job's filesystem, so what it must not read is covered over.
-      { source: path.join(cli.stateDir, id, "empty"), destination: sessions, readonly: true },
     ]);
     expect(await p.status(id)).toBe("running");
     expect((await p.list()).map((s) => s.sandboxId)).toEqual([id]);
+  });
+
+  it("covers every FUSE mount of the job that visibleMounts does not name", async () => {
+    const logs: string[] = [];
+    const table = [
+      "/dev/sda1 / ext4 rw 0 0",
+      "gcsfuse /var/log fuse rw 0 0",
+      "sessions-bucket /sessions fuse.gcsfuse rw 0 0",
+      "snapshots-bucket /snapshots fuse.gcsfuse ro 0 0",
+      "fusectl /sys/fs/fuse/connections fusectl rw 0 0",
+    ].join("\n");
+    const p = provider({ hide: ["/secrets"], visibleMounts: ["/snapshots"], mountTable: table, log: (m) => logs.push(m) });
+    const first = await p.create({ image: "", limits: LIMITS });
+    await p.create({ image: "", limits: LIMITS });
+
+    const empty = path.join(cli.stateDir, first, "empty");
+    const { binds } = await cli.config(first);
+    expect(binds.filter((b) => b.source === empty).map((b) => b.destination)).toEqual([
+      "/secrets",
+      "/var/log",
+      "/sessions",
+    ]);
+    // Said once per provider, with each mount's type and never its source.
+    expect(logs).toEqual(["covering the job's FUSE mounts in sandboxes: /var/log (fuse), /sessions (fuse.gcsfuse)"]);
   });
 
   it("reads the exit code from the marker, which the CLI itself loses", async () => {

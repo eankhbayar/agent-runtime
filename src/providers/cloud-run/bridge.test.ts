@@ -206,7 +206,7 @@ describe("startBridge with a hostile shim", () => {
     expect(bridge!.restarts).toBe(1);
   });
 
-  it("kills a shim that opens too many streams, or reuses an id, or sends an unknown frame", async () => {
+  it("kills a shim that opens too many streams, reuses or goes back to an id, or sends an unknown frame", async () => {
     const { shims, streams } = await start({ maxStreams: 3 });
     for (let id = 1; id <= 4; id++) shims[0]!.stdout.write(encodeFrame(OPEN, id));
     await waitFor(() => shims[0]!.killed);
@@ -220,8 +220,13 @@ describe("startBridge with a hostile shim", () => {
     await waitFor(() => shims[1]!.killed);
 
     await waitFor(() => shims.length === 3);
-    shims[2]!.stdout.write(encodeFrame(77, 1));
+    shims[2]!.stdout.write(encodeFrame(OPEN, 9));
+    shims[2]!.stdout.write(encodeFrame(OPEN, 8));
     await waitFor(() => shims[2]!.killed);
+
+    await waitFor(() => shims.length === 4);
+    shims[3]!.stdout.write(encodeFrame(77, 1));
+    await waitFor(() => shims[3]!.killed);
   });
 
   it("stops reading the shim while a stream's reader is behind, and starts again when it reads", async () => {
