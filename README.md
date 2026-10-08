@@ -12,8 +12,8 @@ src/dispatch/cloud-run/ for an app's Convex: Google tokens without a key, starti
 src/providers/docker/   the Docker `SandboxProvider`, `docker stats` sampling, and gateway control (`createGateway`)
 src/providers/cloud-run/ the Cloud Run `SandboxProvider` for a job's `sandbox` CLI, and the stdio bridge with its in-sandbox shim
 src/pi/runner/          runs in the sandbox: `runAgent`, the pi event adapter, the `save_output` tool
-src/testing/            `FakeSandboxProvider`, `FakeSink`, `FakeRunStore`, a fake `sandbox` CLI and a fake Messages endpoint, for a project's tests
-gateway/                egress gateway image, shared by every runtime: holds the provider key, proxies Anthropic-format Messages calls for valid run tokens
+src/testing/            `FakeSandboxProvider`, `FakeSink`, `FakeRunStore`, a fake `sandbox` CLI and a fake model endpoint (Messages and Chat Completions), for a project's tests
+gateway/                egress gateway image, shared by every runtime: holds the provider key, proxies Anthropic Messages or OpenAI Chat Completions calls for valid run tokens
 infra/cloud-run/        scripts that set up Convex's federation and deploy a Cloud Run Job
 ```
 
@@ -22,7 +22,7 @@ infra/cloud-run/        scripts that set up Convex's federation and deploy a Clo
 Releases are git tags that carry their built `dist/`. The repo is public, so installing one needs no credentials:
 
 ```json
-{ "dependencies": { "@eankhbayar/agent-runtime": "github:eankhbayar/agent-runtime#v0.6.1" } }
+{ "dependencies": { "@eankhbayar/agent-runtime": "github:eankhbayar/agent-runtime#v0.7.0" } }
 ```
 
 `@earendil-works/pi-coding-agent` and `typebox` are peer dependencies, needed only where `./pi/runner` is imported.
@@ -41,7 +41,7 @@ await runAgent({
 });
 ```
 
-The runner reads `PROMPT`, `RUN_ID`, `LLM_*` and `RUN_LIMITS` from its environment and writes run events to stdout as JSON lines. `--check` validates the image without calling a model.
+The runner reads `PROMPT`, `RUN_ID`, `LLM_*` and `RUN_LIMITS` from its environment and writes run events to stdout as JSON lines. `--check` validates the image without calling a model. `LLM_PROVIDER` and `LLM_MODEL` name a model in pi's built-in catalog; for one outside it, such as a model behind an OpenAI-compatible endpoint, see [OpenAI-compatible models](#openai-compatible-models).
 
 The sandbox image is the project's own. Node will not strip types from files under `node_modules`, which is why this package ships JavaScript; copy the installed package into the image's `node_modules` rather than installing it there, so the image runs the version the host's lockfile pinned and its build needs no git.
 
@@ -79,7 +79,7 @@ Build the gateway image from the installed package: `docker build -t myproject-e
 
 ## Run it in a project
 
-Needs Docker (any context: Colima, Docker Desktop, a remote host) and a key for an Anthropic-format Messages endpoint.
+Needs Docker (any context: Colima, Docker Desktop, a remote host) and a key for an Anthropic Messages or OpenAI Chat Completions endpoint.
 
 1. **Install** the tag (see Install) and, in the project that holds the runner, `@earendil-works/pi-coding-agent` and `typebox`.
 2. **Write the runner** (`runner.ts`, the "In the sandbox" snippet): the project's prompt, tools and default model.
@@ -129,6 +129,71 @@ After taking a new tag, rebuild both images. Sandboxes kept with `keepSandbox` s
 A worked example is HKJC's `packages/analysis-runner`: `dispatcher/runtime.ts` (setup), `dispatcher/run-local.ts` (terminal CLI with isolation checks), `dispatcher/serve.ts` (a service with a Convex sink and the reaper), `scripts/stage-runtime.ts` (staging for the image build).
 
 A different sandbox platform is one more `SandboxProvider`; nothing else changes.
+
+## OpenAI-compatible models
+
+The gateway and the runner speak either of two formats. The default is Anthropic Messages, as before: the gateway proxies `/v1/messages` and sends the key as `x-api-key`, and the runner takes a model from pi's catalog. With the `openai` format the gateway proxies OpenAI Chat Completions, and the runner registers a model pi does not know, so any endpoint that serves `POST <base>/chat/completions` with `Authorization: Bearer <key>` works, such as the one hk-legal uses.
+
+**The gateway.** In `openai` format it proxies `POST /v1/chat/completions` to `<baseUrl>/chat/completions` and nothing else (no `/v1/messages`, no `/v1/models`). The agent sends its run token as `Authorization: Bearer rt_…`, the way an OpenAI client sends a key; the gateway drops the client's `authorization`, `x-api-key`, `openai-organization` and `openai-project` and sends `Authorization: Bearer <provider key>`. The token check, unbuffered SSE, the hang-up handling and the logs (no keys, no tokens) are the same as for Messages.
+
+On Docker, give `LlmConfig` the format and the base URL in place of `messagesUrl`:
+
+```ts
+const llm: LlmConfig = {
+  format: "openai",
+  baseUrl: "https://api.example.com/v1",   // calls go to <baseUrl>/chat/completions
+  provider: "example",                      // what the runner registers the model under
+  model: "gpt-6-luna",
+  apiKey: process.env.PROVIDER_API_KEY,
+};
+await gateway.ensure({ image: "myproject-egress-gateway", llm });
+```
+
+The gateway image reads its upstream from its environment, which `ensure` sets:
+
+| Variable | |
+|---|---|
+| `UPSTREAM_FORMAT` | `anthropic` (default) or `openai` |
+| `UPSTREAM_MESSAGES_URL` | `anthropic`: the full Messages endpoint |
+| `UPSTREAM_BASE_URL` | `openai`: the API base; calls go to `<base>/chat/completions` |
+| `UPSTREAM_API_KEY` | the provider key, as `x-api-key` or as a bearer token |
+
+A container started for a different format or URL is replaced on the next `ensure`. In a job, the in-process gateway takes the same choice:
+
+```ts
+const gateway = createInProcessGateway({
+  format: "openai",
+  baseUrl: "https://api.example.com/v1",
+  apiKey: process.env.PROVIDER_API_KEY!,
+});
+```
+
+**The runner.** `LLM_API=openai` makes `runAgent` register a provider of its own with pi (`ModelRuntime.registerProvider`, in memory, with pi's `openai-completions` API) holding the one model `LLM_MODEL`, so the model need not be in pi's catalog and no `models.json` is read or written. Give the runner:
+
+| Variable | |
+|---|---|
+| `LLM_API` | `openai` (pi's `openai-completions`); `anthropic` (`anthropic-messages`) registers a Messages model outside the catalog the same way |
+| `LLM_MODEL` | the model id the endpoint expects (required) |
+| `LLM_BASE_URL` | the gateway (required): `gateway.url` or `provider.bridgeUrl`, as for Messages. A bare origin gets `/v1` added, so the same value works in both formats |
+| `LLM_API_KEY` | the run token, which `executeRun` sets |
+| `LLM_PROVIDER` | the provider id to register; default `openai-compatible` |
+| `LLM_CONTEXT_WINDOW` | tokens, default 128000; compaction works from it |
+| `LLM_MAX_TOKENS` | output tokens per call (reasoning included, for OpenAI reasoning models), default 32768 |
+| `LLM_REASONING` | `true` (default): `THINKING_LEVEL` is sent as `reasoning_effort`. `false` for a model that takes none |
+| `LLM_COMPAT` | optional JSON object of pi's `compat` settings for the model, e.g. `{"supportsDeveloperRole":false,"maxTokensField":"max_tokens"}` for a server that wants a `system` message and `max_tokens` |
+
+```ts
+env: {
+  LLM_API: "openai",
+  LLM_PROVIDER: llm.provider,
+  LLM_MODEL: llm.model,
+  LLM_BASE_URL: gateway.url,   // or provider.bridgeUrl in a Cloud Run job
+},
+```
+
+Without `LLM_API` nothing changes: `LLM_PROVIDER` and `LLM_MODEL` (or `defaultModel`) name a catalog model. `--check` resolves the model as a run would, without calling it, and fails on a missing model or base URL or a value it cannot parse; for a custom model its notice also carries `api`, `baseUrl`, `contextWindow` and `maxTokens`.
+
+pi's defaults for an OpenAI-compatible endpoint are OpenAI's own: the system prompt as a `developer` message, `store: false`, `max_completion_tokens`, `reasoning_effort` and `stream_options.include_usage`. `https://api.lel190.dev/v1`, hk-legal's endpoint, accepts them as they are (checked with `gpt-6-luna`).
 
 ## Stores
 
@@ -225,7 +290,7 @@ A Cloud Run Job deployed with `--sandbox-launcher` can start gVisor sandboxes in
 
 The shim `dist/providers/cloud-run/bridge-peer.js` runs in the sandbox under plain node, listens on `127.0.0.1:<port>` and carries each connection to the job as frames over a long-lived `sandbox exec`'s stdin and stdout (about 40 MB/s in the probe, SSE events arriving as sent). On the job's side, `startBridge` hands each connection to `onConnection`, usually the in-process gateway's `connect`. With the `bridge` option the provider starts the shim once a sandbox exists, starts it again if its exec ends, and stops it on `destroy`.
 
-`createInProcessGateway({ messagesUrl, apiKey })` is the gateway image's handling (run token check, provider key injection, unbuffered streaming, Anthropic-format Messages only) in the job's process, with run tokens in memory. Pass it as `executeRun`'s `tokens`, and give the runner `LLM_BASE_URL` set to `provider.bridgeUrl` (`http://127.0.0.1:8080` by default). The pi runner needs no change. `listen()` serves it on TCP as well, for anything not behind the bridge.
+`createInProcessGateway({ messagesUrl, apiKey })` is the gateway image's handling (run token check, provider key injection, unbuffered streaming) in the job's process, with run tokens in memory. Pass it as `executeRun`'s `tokens`, and give the runner `LLM_BASE_URL` set to `provider.bridgeUrl` (`http://127.0.0.1:8080` by default). The pi runner needs no change. `listen()` serves it on TCP as well, for anything not behind the bridge. For an OpenAI-compatible upstream pass `{ format: "openai", baseUrl, apiKey }` instead (see [OpenAI-compatible models](#openai-compatible-models)).
 
 ### Sessions
 
@@ -279,7 +344,19 @@ Everything a sandbox leaves behind is treated as hostile. `download` runs `tar` 
 
 ### Testing
 
-`createFakeSandboxCli()` from `./testing` writes an executable that behaves as the real CLI does where a test can tell (it loses exit codes, keeps a command running when killed, records every call), to pass as `sandboxBin`; commands run on the test's host with paths inside binds rewritten, and limits are recorded but not applied. `startFakeUpstream({ apiKey })` is a Messages endpoint that checks the key and streams its reply as SSE.
+`createFakeSandboxCli()` from `./testing` writes an executable that behaves as the real CLI does where a test can tell (it loses exit codes, keeps a command running when killed, records every call), to pass as `sandboxBin`; commands run on the test's host with paths inside binds rewritten, and limits are recorded but not applied. `startFakeUpstream({ apiKey })` is a model endpoint that checks the key and streams its reply as SSE: Messages at its `messagesUrl` (key as `x-api-key`), and Chat Completions under its `baseUrl` (key as a bearer token).
+
+## Upgrading from 0.6
+
+Nothing changes at run time unless you ask for the new format. `LlmConfig`, `createInProcessGateway` and `createGatewayHandler` take `{ messagesUrl }` as before, or `{ format: "openai", baseUrl }`; the gateway image still reads `UPSTREAM_MESSAGES_URL`, with `UPSTREAM_FORMAT` and `UPSTREAM_BASE_URL` new and optional. A container started by 0.6's `createGateway` carries the same label and is reused.
+
+One type-level change: `LlmConfig` is now a union, so code that reads `llm.messagesUrl` from a value typed `LlmConfig` no longer compiles until it checks `llm.format !== "openai"` first. HKJC's `dispatcher/job.ts`, `serve.ts` and `run-local.ts` do this. To hand the upstream to the in-process gateway whatever its format, spread the config; the gateway keeps only the upstream's own fields:
+
+```ts
+const gateway = createInProcessGateway({ ...llm, apiKey: process.env.PROVIDER_API_KEY! });
+``` Rebuild the gateway image from the new tag before using the `openai` format, since an old image ignores `UPSTREAM_FORMAT` and would refuse to start without `UPSTREAM_MESSAGES_URL`.
+
+The runner reads `LLM_API` and the variables it brings (see [OpenAI-compatible models](#openai-compatible-models)); without it, it behaves as 0.6. The gateway now also drops `openai-organization` and `openai-project` from requests in both formats. New exports: `GatewayUpstream` from `./core`; `resolveModelConfig`, `registerModel`, `RunnerModelConfig`, `DEFAULT_CONTEXT_WINDOW` and `DEFAULT_MAX_TOKENS` from `./pi/runner`; `chatCompletionEvents` and `FakeUpstream.baseUrl` from `./testing`.
 
 ## Upgrading from 0.6.0
 
