@@ -22,7 +22,7 @@ infra/cloud-run/        scripts that set up Convex's federation and deploy a Clo
 Releases are git tags that carry their built `dist/`. The repo is public, so installing one needs no credentials:
 
 ```json
-{ "dependencies": { "@eankhbayar/agent-runtime": "github:eankhbayar/agent-runtime#v0.6.0" } }
+{ "dependencies": { "@eankhbayar/agent-runtime": "github:eankhbayar/agent-runtime#v0.6.1" } }
 ```
 
 `@earendil-works/pi-coding-agent` and `typebox` are peer dependencies, needed only where `./pi/runner` is imported.
@@ -280,6 +280,10 @@ Everything a sandbox leaves behind is treated as hostile. `download` runs `tar` 
 ### Testing
 
 `createFakeSandboxCli()` from `./testing` writes an executable that behaves as the real CLI does where a test can tell (it loses exit codes, keeps a command running when killed, records every call), to pass as `sandboxBin`; commands run on the test's host with paths inside binds rewritten, and limits are recorded but not applied. `startFakeUpstream({ apiKey })` is a Messages endpoint that checks the key and streams its reply as SSE.
+
+## Upgrading from 0.6.0
+
+0.6.1 fixes a crash in the gateway handler. When an agent hung up in the middle of a streamed answer (a cancelled, timed-out or shut-down run), the aborted upstream body emitted an unhandled `error` and took down the process serving the gateway: the job process with `createInProcessGateway`, or the gateway container under Docker. Take the tag and rebuild the gateway image.
 
 ## Upgrading from 0.5
 

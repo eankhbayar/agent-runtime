@@ -10,6 +10,7 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import type { ReadableStream as WebReadableStream } from "node:stream/web";
 
 /** Who a valid run token belongs to. */
@@ -104,8 +105,9 @@ export function createGatewayHandler(options: GatewayHandlerOptions): GatewayHan
       res.writeHead(upstreamRes.status, headers);
       if (upstreamRes.body) {
         // Piped chunk by chunk, so a streamed response reaches the agent as it is sent.
-        Readable.fromWeb(upstreamRes.body as WebReadableStream).pipe(res);
-        await new Promise((resolve) => res.on("close", resolve));
+        // An agent that hangs up mid-answer (a cancel, a timeout, a shutdown) aborts
+        // the upstream call, which errors the body; that ends this pipeline, not the process.
+        await pipeline(Readable.fromWeb(upstreamRes.body as WebReadableStream), res).catch(() => {});
       } else {
         res.end();
       }

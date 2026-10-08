@@ -93,6 +93,46 @@ describe("createInProcessGateway", () => {
     expect(entries.at(-1)).toMatchObject({ runId: "run_1", path: "/v1/messages", status: 200 });
   });
 
+  it("survives an agent that hangs up in the middle of a streamed answer", async () => {
+    const { gateway, url } = await setup(150);
+    const token = await gateway.grant("run_1", 60_000);
+    const crashes: unknown[] = [];
+    const onCrash = (error: unknown) => crashes.push(error);
+    process.on("uncaughtException", onCrash);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const base = new URL(url);
+        const req = request(
+          {
+            method: "POST",
+            path: "/v1/messages",
+            host: base.hostname,
+            port: Number(base.port),
+            agent: false,
+            headers: { "content-type": "application/json", "x-api-key": token },
+          },
+          (res) => {
+            // A cancelled or timed-out runner drops its connection mid-answer.
+            res.once("data", () => {
+              req.destroy();
+              resolve();
+            });
+          },
+        );
+        req.on("error", () => {});
+        req.end('{"model":"m","stream":true,"messages":[]}');
+        setTimeout(() => reject(new Error("no answer")), 5_000);
+      });
+      // The upstream keeps sending for a while after the hang-up.
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      expect(crashes).toEqual([]);
+      // And the gateway still serves the next call.
+      expect((await post({ url }, "/v1/messages", { "x-api-key": token })).status).toBe(200);
+    } finally {
+      process.off("uncaughtException", onCrash);
+    }
+  });
+
   it("refuses a missing, malformed, unknown, revoked or expired token", async () => {
     const { upstream, gateway, url } = await setup();
     const revoked = await gateway.grant("run_1", 60_000);
