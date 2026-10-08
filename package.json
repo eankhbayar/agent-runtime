@@ -24,6 +24,10 @@
       "types": "./dist/providers/docker/index.d.ts",
       "default": "./dist/providers/docker/index.js"
     },
+    "./providers/cloud-run": {
+      "types": "./dist/providers/cloud-run/index.d.ts",
+      "default": "./dist/providers/cloud-run/index.js"
+    },
     "./pi/runner": {
       "types": "./dist/pi/runner/index.d.ts",
       "default": "./dist/pi/runner/index.js"
