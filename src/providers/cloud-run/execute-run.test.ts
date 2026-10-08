@@ -2,11 +2,12 @@
 // `sandbox` CLI, the stdio bridge, the in-process gateway in front of a fake
 // model, and a DirectorySessionStore carrying the session between runs.
 
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -18,42 +19,12 @@ import { startFakeUpstream, type FakeUpstream } from "../../testing/fake-upstrea
 import { FakeSink } from "../../testing/fakes.ts";
 import { CloudRunSandboxProvider } from "./cloud-run-provider.ts";
 
-// The runner: continues the session in .sessions/, asks the model through
-// LLM_BASE_URL with the run token, and prints run events. PROMPT=sleep makes
-// it wait, to be cancelled or timed out.
-const RUNNER = `
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
-let seq = 0;
-const emit = (type, payload) => process.stdout.write(JSON.stringify({ seq: seq++, ts: new Date().toISOString(), type, payload }) + "\\n");
-mkdirSync(".sessions", { recursive: true });
-const turns = (() => { try { return readFileSync(".sessions/turns.jsonl", "utf8").split("\\n").filter(Boolean).length; } catch { return 0; } })();
-emit("run_started", { turns });
-appendFileSync(".sessions/turns.jsonl", JSON.stringify({ prompt: process.env.PROMPT }) + "\\n");
-if (process.env.PROMPT === "sleep") await new Promise((resolve) => setTimeout(resolve, 60_000));
-const res = await fetch(process.env.LLM_BASE_URL + "/v1/messages", {
-  method: "POST",
-  headers: { "x-api-key": process.env.LLM_API_KEY, "content-type": "application/json" },
-  body: JSON.stringify({ model: "m", stream: true, messages: [{ role: "user", content: process.env.PROMPT }] }),
-});
-const decoder = new TextDecoder();
-let buffer = "";
-for await (const chunk of res.body) {
-  buffer += decoder.decode(chunk, { stream: true });
-  let end;
-  while ((end = buffer.indexOf("\\n\\n")) >= 0) {
-    const data = buffer.slice(0, end).split("\\n").find((l) => l.startsWith("data: "));
-    buffer = buffer.slice(end + 2);
-    const event = data && JSON.parse(data.slice(6));
-    if (event?.delta?.type === "text_delta") emit("text_delta", { delta: event.delta.text });
-  }
-}
-emit("run_finished", { status: res.ok ? "succeeded" : "failed", error: res.ok ? undefined : "model said " + res.status });
-`;
+// Not in a temp directory: a sandbox's /tmp is its own, under the fake too.
+const runner = fileURLToPath(new URL("./fixtures/runner.mjs", import.meta.url));
 
 let cli: FakeSandboxCli;
 let upstream: FakeUpstream;
 let gateway: InProcessGateway;
-let runner: string;
 
 beforeEach(async () => {
   cli = await createFakeSandboxCli();
@@ -62,8 +33,6 @@ beforeEach(async () => {
     reply: (body) => `Turn for ${JSON.stringify((body.messages as { content: string }[])[0]?.content)}.`,
   });
   gateway = createInProcessGateway({ messagesUrl: upstream.messagesUrl, apiKey: "sk-provider", log: () => {} });
-  runner = path.join(await mkdtemp(path.join(tmpdir(), "agent-runtime-runner-")), "runner.mjs");
-  await writeFile(runner, RUNNER);
 });
 
 afterEach(async () => {
@@ -147,7 +116,9 @@ describe("executeRun on Cloud Run", { timeout: 60_000 }, () => {
     const stop = new AbortController();
     const { sink, outcome } = run("sleep", { signal: stop.signal });
     // Once the runner has started, and so written its turn to the session.
-    while (!sink.sent.some((e) => e.type === "run_started")) {
+    let settled = false;
+    outcome.finally(() => (settled = true)).catch(() => {});
+    while (!settled && !sink.sent.some((e) => e.type === "run_started")) {
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
     const stopped = Date.now();

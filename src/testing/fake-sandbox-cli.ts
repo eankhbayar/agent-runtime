@@ -94,15 +94,16 @@ function bindOf(spec: string): Bind {
 
 /** Rewrites sandbox paths in one argument to where they are on this host. */
 function translate(arg: string, config: Config): string {
-  const maps = [
+  const maps = new Map<string, string>([
     ...config.binds.map((b) => [b.destination, b.source] as const),
     ["/tmp", path.join(dirOf(config.id), "tmp")] as const,
-  ].sort((a, b) => b[0].length - a[0].length);
-  let out = arg;
-  for (const [from, to] of maps) {
-    const escaped = from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    out = out.replace(new RegExp(`(^|[\\s'"=:(])${escaped}(?=/|$|[\\s'";)])`, "g"), `$1${to}`);
-  }
+  ]);
+  const escape = (p: string) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // One pass, longest path first, so a rewritten path is never rewritten again
+  // (on Linux the sources are under /tmp themselves).
+  const alternatives = [...maps.keys()].sort((a, b) => b.length - a.length).map(escape).join("|");
+  const pattern = new RegExp(`(^|[\\s'"=:(])(${alternatives})(?=/|$|[\\s'";)])`, "g");
+  const out = arg.replace(pattern, (_, before: string, from: string) => `${before}${maps.get(from)}`);
   // Limits are not applied here: a sandbox's would land on this host's user.
   return out.replace(/(^|[\s;&|(])ulimit /g, "$1: ulimit ");
 }
