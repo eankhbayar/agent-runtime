@@ -6,12 +6,13 @@ Each directory below is imported by its path under `src/`, e.g. `@eankhbayar/age
 
 ```text
 src/contract/           run events, the JSON-lines emitter and parser, and the fold into a view. No Node APIs, so a web app can import it.
-src/core/               runs on the host, for every runtime: `executeRun`, `EventSink`, `RunStore`, the `SandboxProvider` interface, the reaper, `printRunEvent`
+src/core/               runs on the host, for every runtime: `executeRun`, `EventSink`, `RunStore`, `SessionStore`, the `SandboxProvider` interface, the in-process gateway, the reaper, `printRunEvent`
 src/job/                `runJob`: one job execution claims, works and finishes one run
 src/dispatch/cloud-run/ for an app's Convex: Google tokens without a key, starting a Cloud Run Job execution, the redispatch policy. No Node APIs.
 src/providers/docker/   the Docker `SandboxProvider`, `docker stats` sampling, and gateway control (`createGateway`)
+src/providers/cloud-run/ the Cloud Run `SandboxProvider` for a job's `sandbox` CLI, and the stdio bridge with its in-sandbox shim
 src/pi/runner/          runs in the sandbox: `runAgent`, the pi event adapter, the `save_output` tool
-src/testing/            `FakeSandboxProvider`, `FakeSink` and `FakeRunStore`, to drive `executeRun` and a store in a project's tests
+src/testing/            `FakeSandboxProvider`, `FakeSink`, `FakeRunStore`, a fake `sandbox` CLI and a fake Messages endpoint, for a project's tests
 gateway/                egress gateway image, shared by every runtime: holds the provider key, proxies Anthropic-format Messages calls for valid run tokens
 infra/cloud-run/        scripts that set up Convex's federation and deploy a Cloud Run Job
 ```
@@ -21,7 +22,7 @@ infra/cloud-run/        scripts that set up Convex's federation and deploy a Clo
 Releases are git tags that carry their built `dist/`. The repo is public, so installing one needs no credentials:
 
 ```json
-{ "dependencies": { "@eankhbayar/agent-runtime": "github:eankhbayar/agent-runtime#v0.5.0" } }
+{ "dependencies": { "@eankhbayar/agent-runtime": "github:eankhbayar/agent-runtime#v0.6.0" } }
 ```
 
 `@earendil-works/pi-coding-agent` and `typebox` are peer dependencies, needed only where `./pi/runner` is imported.
@@ -198,7 +199,7 @@ if (next) reserve(run, next);
 `infra/cloud-run/` sets it up. Every name is a flag; `--help` lists them and `--dry-run` prints the commands without calling Google or Docker:
 
 - `setup-dispatch-federation.sh`, once per project: the signing key, the pool and provider, and the accounts the subject may impersonate (`--account`), with bucket reads (`--read-bucket`). Give Convex the key, the provider's name and the issuer and subject it prints. It needs Node and the package's `dist/`, which a tag has.
-- `deploy-job.sh`: builds the image for linux/amd64, pushes it, deploys the job by digest and lets each `--invoker` run it with overrides. Relative paths are the repository's. An image built from uncommitted sources is tagged `<commit>-wip-<time>`. Configuration reaches gcloud in a mode-600 file; secrets come from Secret Manager (`--secret`), and `--env-from` keeps a value out of argv.
+- `deploy-job.sh`: builds the image for linux/amd64, pushes it, deploys the job by digest and lets each `--invoker` run it with overrides. `--sandbox-launcher` lets the job start sandboxes, and `--mount-bucket-rw` mounts a bucket read-write. Relative paths are the repository's. An image built from uncommitted sources is tagged `<commit>-wip-<time>`. Configuration reaches gcloud in a mode-600 file; secrets come from Secret Manager (`--secret`), and `--env-from` keeps a value out of argv.
 
 ```bash
 bash node_modules/@eankhbayar/agent-runtime/infra/cloud-run/deploy-job.sh \
@@ -208,6 +209,83 @@ bash node_modules/@eankhbayar/agent-runtime/infra/cloud-run/deploy-job.sh \
   --invoker myapp-job-invoker@myproject.iam.gserviceaccount.com \
   --env WORKER_MODE=job --secret PROVIDER_API_KEY=PROVIDER_API_KEY --mount-bucket myapp-data:/data
 ```
+
+## Sandboxes on Cloud Run
+
+A Cloud Run Job deployed with `--sandbox-launcher` can start gVisor sandboxes inside its own instance with the `sandbox` CLI at `/usr/local/gcp/bin/sandbox`. `./providers/cloud-run` runs a run's agent in one, so a job started for a run needs no Docker host. What it relies on, as the probe in HKJC's `spike/cloud-run-sandbox` found it:
+
+- A sandbox's root is the job container's own filesystem, read-only, with its writes in an overlay and its own `/tmp`. So the job image is the sandbox image: whatever the runner needs is installed in the job's image, and the job's node and its copy of this package are at the same paths inside the sandbox. It also means the sandbox can read every file the job can. So every FUSE mount of the job, a Cloud Storage volume or one of the platform's own such as Cloud Run's `/var/log`, gets an empty read-only directory over it in each sandbox unless it is listed in `visibleMounts`, and the provider logs (through `log`) which it covered. List anything else it must not read in `hide`, and give the job its secrets as environment variables, which a sandbox does not inherit, not as files. The `sandbox` CLI itself gets only `PATH` and `HOME`, plus `cliEnv`.
+- Without `--allow-egress` a sandbox has no network at all: no DNS, no metadata server, none of the job's listeners. The provider never passes `--allow-egress` or `--publish`. The runner reaches the model over the stdio bridge.
+- The job must run as root to start sandboxes. Each sandbox runs as a mapped root that may write a bind-mounted directory only when it is root-owned 755 or open, so the provider makes each sandbox's workspace that way, under `stateDir` (in the job's `/tmp`, which sandboxes cannot see).
+- `sandbox exec` loses the exit code, and killing it leaves a command with children running. Every command runs under a wrapper that prints the code after a marker and records a pid file; `kill` and timeouts signal the pid, and a timeout exits 124 as on Docker.
+- There is no CPU limit, no pause and no list. Memory is capped with `ulimit -v` at the run's `memoryMb` plus `memoryHeadroomMb` (1536 by default, since Node reserves about 1.4 GiB of address space before allocating anything) and processes with `ulimit -p`. A limit one command sets holds for the rest of the sandbox and can only be lowered, so every command sets the same ones. The cap is per process, and a sandbox's memory is the job instance's: size the job for the sandbox and itself, since a sandbox that exhausts the instance takes the job down.
+- `pause` and `resume` fail, so `executeRun` builds a new sandbox each run; with `session` it carries the agent's session from one to the next.
+
+### The bridge and the in-process gateway
+
+The shim `dist/providers/cloud-run/bridge-peer.js` runs in the sandbox under plain node, listens on `127.0.0.1:<port>` and carries each connection to the job as frames over a long-lived `sandbox exec`'s stdin and stdout (about 40 MB/s in the probe, SSE events arriving as sent). On the job's side, `startBridge` hands each connection to `onConnection`, usually the in-process gateway's `connect`. With the `bridge` option the provider starts the shim once a sandbox exists, starts it again if its exec ends, and stops it on `destroy`.
+
+`createInProcessGateway({ messagesUrl, apiKey })` is the gateway image's handling (run token check, provider key injection, unbuffered streaming, Anthropic-format Messages only) in the job's process, with run tokens in memory. Pass it as `executeRun`'s `tokens`, and give the runner `LLM_BASE_URL` set to `provider.bridgeUrl` (`http://127.0.0.1:8080` by default). The pi runner needs no change. `listen()` serves it on TCP as well, for anything not behind the bridge.
+
+### Sessions
+
+`SessionStore` is `save(key, fromDir)` and `restore(key, intoDir)`. `DirectorySessionStore(rootDir)` keeps one tar per key and replaces it by rename, so it works on a Cloud Storage FUSE volume the job mounts read-write (it needs `tar` on the job's PATH). With `session: { store, key }`, `executeRun` restores the session into a sandbox it builds before the runner starts, and saves it once the runner has exited, whether it finished, failed, timed out or was stopped. A store that cannot be read fails the run rather than letting it start over and then save a shorter session over the thread's. `remoteDir` defaults to `/workspace/.sessions`, where the pi runner keeps its session. `RunOutcome.session` says whether one was restored and whether it was saved. Two runs of the same key that end together both save and the last one wins, so do not run a thread twice at once.
+
+### A job
+
+```ts
+import { createInProcessGateway, DirectorySessionStore, executeRun } from "@eankhbayar/agent-runtime/core";
+import { runJob } from "@eankhbayar/agent-runtime/job";
+import { CloudRunSandboxProvider } from "@eankhbayar/agent-runtime/providers/cloud-run";
+
+const gateway = createInProcessGateway({ messagesUrl: llm.messagesUrl, apiKey: process.env.PROVIDER_API_KEY! });
+const provider = new CloudRunSandboxProvider({
+  namespace: "myproject",
+  bridge: { port: 8080, onConnection: gateway.connect },
+  hide: ["/sessions", "/snapshots"],     // other threads' sessions; the snapshot is bound where the run needs it
+});
+const sessions = new DirectorySessionStore("/sessions");
+
+const result = await runJob(store, {
+  runId: process.env.RUN_ID!,
+  work: async (claim, signal) => {
+    const { status, error, answerText, usage } = await executeRun({
+      provider,
+      tokens: gateway,
+      sink: claim,
+      runId: claim.runId,
+      prompt: claim.payload.prompt,
+      signal,
+      command: ["node", "/opt/runner/runner.js"],
+      image: "unused",                 // the sandbox runs the job's own image
+      limits: { wallClockMs: 15 * 60_000, cpus: 1.5, memoryMb: 1536 },
+      mounts: [{ localDir: `/snapshots/${claim.payload.release}`, remoteDir: "/data", mounted: true }],
+      env: { LLM_PROVIDER: llm.provider, LLM_MODEL: llm.model, LLM_BASE_URL: provider.bridgeUrl },
+      session: { store: sessions, key: claim.payload.threadId },
+    });
+    return { status, error, answerText, usage };
+  },
+});
+process.exit(result.exitCode);
+```
+
+Deploy it with `infra/cloud-run/deploy-job.sh ... --sandbox-launcher --mount-bucket-rw <sessions-bucket>:/sessions --mount-bucket <snapshots-bucket>:/snapshots --secret PROVIDER_API_KEY=...`. The job image must not set `USER`, since only root can start sandboxes. `smoke/cloud-run/` is a complete example, run against Cloud Run with a fake model in the job.
+
+A `mounted` mount is bound read-only when the sandbox is created rather than copied in, for a snapshot on the job's Cloud Storage volume; `verify` still hashes it. Since the snapshot volume itself is covered in the sandbox, the bind's destination must be outside it (`/data`, not under `/snapshots`). Other mounts are copied in through tar on a `sandbox exec`'s stdin. The agent is root in its sandbox, so a copied mount is writable to it; only a `mounted` one is read-only.
+
+### What comes out of a sandbox
+
+Everything a sandbox leaves behind is treated as hostile. `download` runs `tar` inside the sandbox, so links resolve in the sandbox's own view, streams the archive to the job under `maxDownloadBytes` (512 MiB by default), and unpacks it with `extractPlainTar`, which creates only directories and regular files and refuses links, devices, `..` or absolute paths and cut-off archives. On every provider, Docker included, `executeRun` stores an output only if it is a regular file (opened without following links), saves a session only if it is plain files and directories, and caps each at 256 MiB; anything else is logged and left out. The bridge takes frames of at most 1 MiB, at most 64 streams at once, ids that only grow, and kills a shim that breaks any of that; it stops reading a shim whose streams' readers are behind.
+
+### Testing
+
+`createFakeSandboxCli()` from `./testing` writes an executable that behaves as the real CLI does where a test can tell (it loses exit codes, keeps a command running when killed, records every call), to pass as `sandboxBin`; commands run on the test's host with paths inside binds rewritten, and limits are recorded but not applied. `startFakeUpstream({ apiKey })` is a Messages endpoint that checks the key and streams its reply as SSE.
+
+## Upgrading from 0.5
+
+Nothing is renamed or removed. On Docker the one change is that outputs and sessions containing symlinks or other non-regular files are now refused (logged), and each is capped at 256 MiB. New: `./providers/cloud-run`, `createInProcessGateway` and `MemoryTokenGrant`, `createGatewayHandler`, `SessionStore` and `DirectorySessionStore`, `executeRun`'s `session` option and `RunOutcome.session`, `Mount.mounted`, `extractPlainTar`, and `SandboxProvider.create`'s optional `binds`, which `DockerSandboxProvider` refuses. A provider of a project's own needs no change unless it wants to support `mounted`. `FakeSandboxProvider` now keeps files in `fs` (seeded from `files`), and `download` copies directories from it.
+
+The gateway image now copies `gateway-handler.ts` beside `server.ts`; rebuild it from the new tag as usual, with the same command.
 
 ## Upgrading from 0.4
 
