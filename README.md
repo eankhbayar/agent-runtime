@@ -23,7 +23,7 @@ infra/cloud-run/        scripts that set up Convex's federation and deploy a Clo
 Releases are git tags that carry their built `dist/`. The repo is public, so installing one needs no credentials:
 
 ```json
-{ "dependencies": { "@eankhbayar/agent-runtime": "github:eankhbayar/agent-runtime#v0.8.0" } }
+{ "dependencies": { "@eankhbayar/agent-runtime": "github:eankhbayar/agent-runtime#v0.9.0" } }
 ```
 
 `@earendil-works/pi-coding-agent` and `typebox` are peer dependencies, needed only where `./pi/runner` is imported. `./models` needs no AI SDK package; an app that wants an AI SDK model passes in the factories it already imports (see [Models](#models)).
@@ -84,10 +84,10 @@ Needs Docker (any context: Colima, Docker Desktop, a remote host) and a key for 
 
 1. **Install** the tag (see Install) and, in the project that holds the runner, `@earendil-works/pi-coding-agent` and `typebox`.
 2. **Write the runner** (`runner.ts`, the "In the sandbox" snippet): the project's prompt, tools and default model.
-3. **Build the sandbox image.** It needs Node 22.18+, whatever the agent's tools call (Python, DuckDB, ripgrep…), pi and typebox installed with npm, this package copied into `node_modules`, and the runner. It must run as a non-root user that owns `/workspace`:
+3. **Build the sandbox image.** It needs Node 24+, whatever the agent's tools call (Python, DuckDB, ripgrep…), pi and typebox installed with npm, this package copied into `node_modules`, and the runner. It must run as a non-root user that owns `/workspace`:
 
    ```dockerfile
-   FROM node:24-bookworm-slim
+   FROM node:24.21.0-bookworm-slim
    COPY sandbox/package.json /opt/runner/package.json      # pi-coding-agent and typebox only
    RUN cd /opt/runner && npm install --omit=dev --ignore-scripts
    COPY .image/agent-runtime /opt/runner/node_modules/@eankhbayar/agent-runtime   # package.json + dist/, staged from the host's node_modules
