@@ -162,6 +162,7 @@ describe("createPipelineEvents", () => {
     await trace.flush();
     expect(sink.sent.map((e) => e.payload.message)).toEqual(["one", "two"]);
     expect(trace.state).toEqual({ cancelled: true, gone: true });
+    expect(sink.lines).toEqual(["dropped 1 pipeline event(s): the run is gone"]);
   });
 
   it("drops the rest after the retries run out, and the pipeline goes on", async () => {
@@ -172,6 +173,27 @@ describe("createPipelineEvents", () => {
     await trace.flush();
     expect(sink.sent).toHaveLength(0);
     expect(sink.lines.at(-1)).toBe("giving up on 2 pipeline event(s): Error: connection lost");
+    trace.notice("progress", "after");
+    await trace.flush();
+    expect(sink.lines.at(-1)).toBe("dropped 1 pipeline event(s): the run is gone");
+  });
+
+  it("writes the artifact with a null id when the sink cannot store it, and does not throw", async () => {
+    const sink = new FakeSink();
+    sink.artifact = async () => {
+      throw new Error("bucket unavailable");
+    };
+    const trace = createPipelineEvents(sink, fast);
+    const bytes = new TextEncoder().encode("# Memo");
+    const id = await trace.artifact({
+      upload: { kind: "report", fileName: "memo.md", caption: "Memo", mediaType: "text/markdown", sha256: "abc", size: bytes.length, bytes },
+    });
+    await trace.finish();
+    expect(id).toBeNull();
+    expect(sink.lines).toEqual(["could not store memo.md: Error: bucket unavailable"]);
+    expect(foldRunEvents(sink.sent, "succeeded").items).toEqual([
+      { kind: "artifact", id: "artifact-0", artifactId: null, path: "memo.md", caption: "Memo" },
+    ]);
   });
 
   it("stores an upload through the sink and writes its id", async () => {

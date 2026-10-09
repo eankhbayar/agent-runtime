@@ -76,7 +76,12 @@ export type PipelineEvents = {
   text: (delta: string) => void;
   /** `notice`. Shown when it has a message, or a kind the trace knows. */
   notice: (kind: string, message?: string, extra?: Record<string, unknown>) => void;
-  /** Stores the upload through the sink if there is one, then writes `artifact`. Resolves with its id. */
+  /**
+   * Stores the upload through the sink if there is one, then writes
+   * `artifact`, and resolves with the stored id. Never rejects: an upload the
+   * sink fails is logged and the event written with a null id, as executeRun
+   * does.
+   */
   artifact: (artifact: PipelineArtifact) => Promise<string | null>;
   /** `turn_end` carrying one model call's usage, which the trace sums. */
   usage: (usage: PipelineUsage, extra?: { model?: string; stopReason?: string; step?: string }) => void;
@@ -152,7 +157,9 @@ export function createPipelineEvents(sink: EventSink, options: PipelineEventsOpt
     const batch = pending;
     pending = [];
     flushing = flushing.then(async () => {
-      if (batch.length > 0 && !gone) await send(batch);
+      if (batch.length === 0) return;
+      if (gone) sink.log(`dropped ${batch.length} pipeline event(s): the run is gone`);
+      else await send(batch);
     });
     return flushing.then(() => state);
   };
@@ -232,7 +239,16 @@ export function createPipelineEvents(sink: EventSink, options: PipelineEventsOpt
     },
 
     async artifact(artifact) {
-      const artifactId = "upload" in artifact ? await sink.artifact(artifact.upload) : artifact.artifactId;
+      let artifactId: string | null = null;
+      if (!("upload" in artifact)) artifactId = artifact.artifactId;
+      else {
+        try {
+          artifactId = await sink.artifact(artifact.upload);
+        } catch (cause) {
+          // As executeRun does: the event still lands, with no stored file behind it.
+          sink.log(`could not store ${artifact.upload.fileName}: ${String(cause)}`);
+        }
+      }
       const path = artifact.path ?? ("upload" in artifact ? artifact.upload.fileName : "");
       const caption = artifact.caption ?? ("upload" in artifact ? artifact.upload.caption : "");
       const kind = artifact.kind ?? ("upload" in artifact ? artifact.upload.kind : undefined);
