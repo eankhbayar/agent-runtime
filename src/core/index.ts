@@ -7,3 +7,4 @@ export * from "./session-store.ts";
 export * from "./gateway-handler.ts";
 export * from "./gateway.ts";
 export * from "./plain-files.ts";
+export * from "./pipeline-events.ts";

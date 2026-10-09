@@ -6,7 +6,8 @@ Each directory below is imported by its path under `src/`, e.g. `@eankhbayar/age
 
 ```text
 src/contract/           run events, the JSON-lines emitter and parser, and the fold into a view. No Node APIs, so a web app can import it.
-src/core/               runs on the host, for every runtime: `executeRun`, `EventSink`, `RunStore`, `SessionStore`, the `SandboxProvider` interface, the in-process gateway, the reaper, `printRunEvent`
+src/core/               runs on the host, for every runtime: `executeRun`, `EventSink`, `RunStore`, `SessionStore`, the `SandboxProvider` interface, the in-process gateway, the reaper, `printRunEvent`, `createPipelineEvents`
+src/models/             model endpoints, one chat call in either format, usage and cost, route digests, an AI SDK adapter. No Node APIs, so Convex can import it.
 src/job/                `runJob`: one job execution claims, works and finishes one run
 src/dispatch/cloud-run/ for an app's Convex: Google tokens without a key, starting a Cloud Run Job execution, the redispatch policy. No Node APIs.
 src/providers/docker/   the Docker `SandboxProvider`, `docker stats` sampling, and gateway control (`createGateway`)
@@ -22,10 +23,10 @@ infra/cloud-run/        scripts that set up Convex's federation and deploy a Clo
 Releases are git tags that carry their built `dist/`. The repo is public, so installing one needs no credentials:
 
 ```json
-{ "dependencies": { "@eankhbayar/agent-runtime": "github:eankhbayar/agent-runtime#v0.7.0" } }
+{ "dependencies": { "@eankhbayar/agent-runtime": "github:eankhbayar/agent-runtime#v0.8.0" } }
 ```
 
-`@earendil-works/pi-coding-agent` and `typebox` are peer dependencies, needed only where `./pi/runner` is imported.
+`@earendil-works/pi-coding-agent` and `typebox` are peer dependencies, needed only where `./pi/runner` is imported. `./models` needs no AI SDK package; an app that wants an AI SDK model passes in the factories it already imports (see [Models](#models)).
 
 ## In the sandbox
 
@@ -195,6 +196,86 @@ Without `LLM_API` nothing changes: `LLM_PROVIDER` and `LLM_MODEL` (or `defaultMo
 
 pi's defaults for an OpenAI-compatible endpoint are OpenAI's own: the system prompt as a `developer` message, `store: false`, `max_completion_tokens`, `reasoning_effort` and `stream_options.include_usage`. `https://api.lel190.dev/v1`, hk-legal's endpoint, accepts them as they are (checked with `gpt-6-luna`).
 
+## Models
+
+`./models` is the model layer an app's host code calls directly, outside any sandbox: a Convex action, a pipeline worker, a script. It uses only `fetch`, `TextDecoder`, timers and Web Crypto, so it runs in Convex's default runtime as well as in Node (`tsconfig.models.json` typechecks it without Node's globals, and a test keeps it from importing anything but itself and the contract). It holds what every app needs to call a model the same way; policy stays in the app: which routes exist and who approved them, prompt bundles, budgets, retries, output validation.
+
+**Endpoints.** A `ModelEndpoint` is where a model is called, in which format, and which variable holds the key. Its URL half has the same shape as the gateway's `GatewayUpstream`, so an endpoint spreads into `createInProcessGateway({ ...endpoint, apiKey })` or a Docker `LlmConfig` as it is.
+
+```ts
+import { modelEndpoint, modelEndpointFromEnv } from "@eankhbayar/agent-runtime/models";
+
+// { format: "openai", baseUrl: "https://api.lel190.dev/v1", model: "gpt-6-luna", apiKeyEnv: "KIMI_API_KEY" }
+const endpoint = modelEndpointFromEnv(process.env, {
+  format: "MODEL_FORMAT", url: "MODEL_BASE_URL", model: "MODEL_ID", apiKey: "KIMI_API_KEY",
+}, { format: "openai", url: "https://api.lel190.dev/v1", model: "gpt-6-luna" });
+```
+
+`modelEndpoint({ format, url, model })` takes the loose forms the apps configure: the format as `openai`, `openai-compatible`, `chat-completions`, `anthropic`, `anthropic-compatible` or `messages` (any case); an OpenAI URL as the base or the full `…/chat/completions`; an Anthropic URL as the Messages endpoint, its `/v1` base, or a bare origin (which gets `/v1/messages`). `endpointUrl` is where calls are posted, `sdkBaseUrl` the `baseURL` an SDK wants, and `apiKeyFor(endpoint, env)` reads the key from `apiKeyEnv`, naming the variable if it is unset. The key itself is never part of an endpoint.
+
+**One call.** `callModel(endpoint, request, options)` makes one chat call in the endpoint's format, streamed (SSE) or not, and resolves with the same result either way:
+
+```ts
+import { apiKeyFor, callModel } from "@eankhbayar/agent-runtime/models";
+
+const result = await callModel(endpoint, {
+  system: "…",
+  messages: [{ role: "user", content: question }],
+  maxOutputTokens: 6_000,
+  reasoningEffort: "low",                        // OpenAI's reasoning_effort
+  structuredOutput: { name: "memo", strict: true, schema },   // OpenAI's response_format: json_schema
+  stream: true,
+}, {
+  apiKey: apiKeyFor(endpoint, process.env),
+  signal,                                        // aborting fails the call with `cancelled`
+  timeouts: { connectionMs: 30_000, noProgressMs: 90_000, invocationMs: 600_000 },
+  onText: (delta) => …,                          // the answer as it arrives
+});
+// result: { text, usage, stopReason, model, requestId?, responseId?, createdAt?, connectionMs, durationMs }
+```
+
+Stream calls that run under a route's timeouts. A non-streamed call gets its headers only once the whole answer is generated, so a long answer can fail with `connection_timeout` while the provider is still working; a streamed one gets its headers at once, and `noProgressMs` then watches the tokens arrive. hk-legal's worker streams its OpenAI calls for this reason.
+
+`extraBody` adds top-level fields the endpoint takes (`temperature`, `thinking`); the fields the call sets win over it. `headers` adds request headers (`anthropic-beta`); the auth header is always the call's own: `Authorization: Bearer` for OpenAI, `x-api-key` with `anthropic-version: 2023-06-01` for Anthropic. `maxTokensField: "max_completion_tokens"` is for an OpenAI endpoint that wants it instead of `max_tokens`. An Anthropic endpoint cannot take `structuredOutput` (`structured_output_unsupported`) and is not sent `reasoningEffort`. `onConnected` fires when the headers arrive and `onProgress` on each chunk, for an app that keeps its own lifecycle record. A server that ignores `stream` and answers with JSON is read as JSON.
+
+The call is never retried here. Every failure of the call itself is a `ModelCallError` whose `message` is its `code`, with `retryable`, `retryAfterMs` (from `retry-after`, for a retryable code), `status`, and `provider`: the endpoint's own error `type`, `code` and `param`, each kept only if it is a short identifier. Nothing else of a response, no message, body, URL or key, and no `cause`, leaves the module, since a provider's message can quote the prompt. An error the app's own code throws (`onText`, `onProgress`, `onConnected`, `classify`, an `extraBody` JSON cannot encode) is rethrown as it is, never turned into a retryable code, so an app bug cannot set off a paid retry. Only fetch's own failures and a body cut off become `connection_failure`. However a call ends, a body left unread is cancelled, even when the `fetch` ignores its signal.
+
+| `code` | when | retryable |
+|---|---|---|
+| `authentication_failed`, `permission_denied` | 401, 403 | no |
+| `invalid_request` | any other 4xx | no |
+| `context_overflow` | 413, or the endpoint says the context is too long | no |
+| `quota_exhausted`, `subscription_required` | the endpoint says so | no |
+| `concurrency_throttle` | 429 | yes |
+| `overload` | 529, or an overloaded error, also mid-stream | yes |
+| `http_5xx` | 5xx | yes |
+| `connection_failure` | no response: DNS, TLS, a reset, a body cut off | yes |
+| `connection_timeout`, `no_progress_timeout`, `invocation_timeout` | `timeouts.connectionMs`, `noProgressMs`, `invocationMs` ran out | yes |
+| `cancelled` | the caller's signal aborted | no |
+| `provider_response_invalid` | a 2xx that is not an answer of the format, holds no text, or exceeds 32 MiB | no |
+| `structured_output_unsupported` | structured output asked of an Anthropic endpoint | no |
+
+These are hk-legal's provider codes, with the same retryable set. `classify` picks the code for a refusal before the defaults do, for a provider that signals in its own way (hk-legal's `x-kimi-error-code` header); return undefined to fall back.
+
+**Usage and cost.** `ModelUsage` is the same way round in both formats: `inputTokens` counts every prompt token (Anthropic's cache reads and writes are added to its `input_tokens`), `outputTokens` the visible output, `reasoningTokens` what OpenAI reports as reasoning (taken out of `completion_tokens`), `cacheReadTokens` and `cacheWriteTokens` the cached part of the input. `openAiUsage` and `anthropicUsage` read a usage object of either format, for code that gets one elsewhere. `modelCost(usage, pricing)` prices it in US dollars from per-million rates (`inputUsdPerMillionTokens`, `outputUsdPerMillionTokens`, optional cache rates), output and reasoning at the output rate; without cache rates that is hk-legal's pay-as-you-go equivalent. Two differences from hk-legal's own code are deliberate, and can move its figures a little on adoption. Its `kimi-provider.ts` counts Anthropic's `input_tokens` alone, so with prompt caching in use `inputTokens` here is larger, and so is anything budgeted on it. Its `model-invocation.ts` rounds only the total cost to eight places, where `modelCost` rounds each part and sums those, so totals can differ in the eighth place. `turnUsage(usage, pricing?)` gives the call as one turn of the run trace, in pi's convention (`input` without the cache, `output` with reasoning), for a pipeline's `usage` or a `turn_end`.
+
+**Routes.** A route is an app's immutable record of how a model is called, pinned by a digest of every field. The package fixes only `ModelRoute<Policy>`: an id, a model, a digest, and the app's own `Policy` fields, which it names as it likes. `manifestDigest(manifest)` is SHA-256 over `stableJson` (keys sorted at every level) of every field but `digest`, the scheme hk-legal uses, so its Model Route and Prompt Bundle digests come out the same (a test pins one of each). One difference: `stableJson` leaves out a property whose value is undefined, as `JSON.stringify` does, where hk-legal's local `stable` writes `"key":undefined`. None of hk-legal's pinned manifests has an undefined field, but a manifest that does digests differently here, and so do records with optional fields such as hk-legal's invocation input digests, which should stay on its own function. `sealManifest(draft)` returns a frozen copy with its digest, for writing a new route; `checkManifestDigest(route)` says whether a pinned digest still matches. The manifests, their registry, promotion evidence and prompt bundles stay in the app.
+
+**The AI SDK.** `createAiSdkModel(endpoint, factories, { apiKey })` builds an AI SDK model with the factories the app already imports, so this package depends on no AI SDK version and the result is the app's own model type:
+
+```ts
+import { createAnthropic } from "@ai-sdk/anthropic";
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+import { apiKeyFor, createAiSdkModel } from "@eankhbayar/agent-runtime/models";
+
+const model = createAiSdkModel(endpoint, {
+  openai: (settings, id) => createOpenAICompatible(settings).chatModel(id),
+  anthropic: (settings, id) => createAnthropic(settings).languageModel(id),
+}, { apiKey: apiKeyFor(endpoint, process.env) });
+```
+
+The settings carry `baseURL` (`sdkBaseUrl`), `apiKey`, `headers`, a `fetch`, and a `name`: `options.name`, else the endpoint's `provider`, in either format. With neither, OpenAI gets `openai-compatible` (`createOpenAICompatible` requires a name) and Anthropic gets none and keeps the SDK's own (`anthropic.messages`). Since the name is the key a call's `providerOptions` sit under, leave `provider` off an Anthropic endpoint whose calls pass options under `anthropic`. `transformBody` rewrites each JSON request body before it is sent, as hk-legal's `kimiFetch` does (`bodyRewritingFetch` is the wrapper on its own); a body it cannot parse or rewrite goes unchanged, and a failed request is not sent twice. `aiSdkProviderSettings` returns the settings for an app that calls a factory itself (`createOpenAI(settings).chat(id)`). It is tested against `@ai-sdk/openai-compatible` 3.0.51 (HKJC pins it), `@ai-sdk/openai` 4.0.72 with `createOpenAI(settings).chat(id)` and `@ai-sdk/anthropic` 4.0.59 (hk-legal's Convex takes `^4.0.45` and `^4.0.40`), all as dev dependencies.
+
 ## Stores
 
 `EventSink` is all `executeRun` writes to. A worker that claims runs itself, such as a job started for one run, uses a `RunStore`: `claim({ runId, idempotencyKey })` returns a `ClaimedRun` that is the run's sink, with the app's payload, `heartbeat()` and `finish(ending)`. `executeRun` never beats or finishes, so its caller does both, usually through `runJob` (see Jobs); a store fails a run that goes quiet (HKJC's after 90 s).
@@ -225,6 +306,47 @@ process.exit(result.exitCode); // so a lingering socket cannot hold the executio
 ```
 
 The store comes first so that the work and `failed` are typed by its claim: with an ending of the app's own, the work returns it as a literal with no annotation, and `failed: (error, stopped) => ending` is required. `result.kind` is `idle` (nothing to claim) or `finished` (the store answered the finish, whatever the ending), which exit 0, or one that leaves the run to the store and exits 1: `stopped` (told to stop before claiming), `unclaimed` (refused, or never answered), `released`, or `unfinished` (the finish failed; the store reaps the run). The work's signal may already be aborted when the work starts; its `reason` is `cancelled`, `gone` or `shutdown`.
+
+## Pipeline run events
+
+A pipeline is a run whose work is the app's own code rather than an agent in a sandbox: hk-legal's Research Worker, which runs its stages under `runJob` against its own store. `createPipelineEvents(sink)` from `./core` lets it write the same `RunEvent` stream the pi runner writes, so an app shows both kinds of run with `foldRunEvents` and one trace view. The sink is usually the run's claim, as for `executeRun`.
+
+```ts
+import { createPipelineEvents } from "@eankhbayar/agent-runtime/core";
+import { callModel, turnUsage } from "@eankhbayar/agent-runtime/models";
+
+work: async (claim, signal) => {
+  const firstSeq = claim.payload.nextEventSeq;   // the app's store says where the run's log ends: 0 on its first attempt
+  const trace = createPipelineEvents(claim, { firstSeq });
+  if (firstSeq === 0) trace.start({ model: `${endpoint.provider}/${endpoint.model}` });
+  const frame = await trace.step("framing", async () => {
+    const result = await callModel(endpoint, request, { apiKey, signal });
+    trace.usage(turnUsage(result.usage, pricing), { model: endpoint.model, step: "framing" });
+    return parseFrame(result.text);
+  }, { args: { question }, result: (f) => `${f.issues.length} issues` });
+  …
+  await trace.finish();
+  return ending;
+}
+```
+
+How a pipeline maps onto the trace:
+
+| the pipeline | writes | the folded view shows |
+|---|---|---|
+| begins the run (its first attempt only) | `start({ model, ... })`: `run_started` | the run's model and start time |
+| runs a stage or sub-step | `step(name, work, { args, result })`: `tool_start`, then `tool_end` | a tool item named for the step, with its arguments, duration, result, and `done` or `error` |
+| calls a model | `usage(turnUsage(result.usage, pricing), { model, step })`: `turn_end` | tokens and cost summed into `usage`, one turn per call |
+| reaches a state worth a line (paused for review, suspended for the corpus, retrying) | `notice(kind, message)` | a notice with the message |
+| produces an output | `artifact({ artifactId, path, caption })`, or `{ upload }` to store it through the sink first | an artifact item |
+| writes answer text | `text(delta)`: `text_delta` | a text item; `answerText` joins them |
+| ends the run | `finish({ error?, followUps? })`: `run_finished`, then a flush | the end time, the error, follow-ups |
+
+A step that throws ends as an error and the error is rethrown. What it shows is `errorResult(error)`, by default the error's `safeCode` or `code` when it looks like an identifier and otherwise `failed`, never the message, since the trace is shown to users and a message can quote a provider or the matter. A step still running when the run fails or is cancelled folds as `interrupted`. Steps may nest or overlap; each step's id is its `tool_start`'s seq.
+
+Write `start` once and `finish` once per run, not per attempt: a pause for review or a released attempt is a `notice`, and the run's next attempt continues the same log with `firstSeq` set one past the stored log's last seq, so a sink that dedupes on seq keeps every new event. Events after `finish` are dropped and logged. The store needs an event log for any of this to reach a user: hk-legal's protocol 5 has none yet, so its claim's `events` stores nothing (see the top of `src/core/run-store.ts`) until it gains an append operation that dedupes on seq.
+
+Emitting never throws and never waits. Events are batched (`batchMs`, 150 ms, or `batchEvents`, 25) and sent one batch at a time in seq order; a batch the sink rejects is sent again unchanged up to `retries` (4) times, and then, as when the sink answers `gone`, every later batch is dropped and logged. An upload the sink fails to store is logged and its `artifact` event still written, with a null id, as `executeRun` does; `artifact()` never rejects. The pipeline's work goes on regardless, since the trace is not its record of the run; `flush()` sends what is waiting and resolves with the sink's answer, and `state` holds the latest one, so a pipeline can stop on a cancel the sink reports. `events` is everything written, to fold locally.
 
 ## Cloud Run
 
@@ -344,7 +466,11 @@ Everything a sandbox leaves behind is treated as hostile. `download` runs `tar` 
 
 ### Testing
 
-`createFakeSandboxCli()` from `./testing` writes an executable that behaves as the real CLI does where a test can tell (it loses exit codes, keeps a command running when killed, records every call), to pass as `sandboxBin`; commands run on the test's host with paths inside binds rewritten, and limits are recorded but not applied. `startFakeUpstream({ apiKey })` is a model endpoint that checks the key and streams its reply as SSE: Messages at its `messagesUrl` (key as `x-api-key`), and Chat Completions under its `baseUrl` (key as a bearer token).
+`createFakeSandboxCli()` from `./testing` writes an executable that behaves as the real CLI does where a test can tell (it loses exit codes, keeps a command running when killed, records every call), to pass as `sandboxBin`; commands run on the test's host with paths inside binds rewritten, and limits are recorded but not applied. `startFakeUpstream({ apiKey })` is a model endpoint that checks the key and streams its reply as SSE: Messages at its `messagesUrl` (key as `x-api-key`), and Chat Completions under its `baseUrl` (key as a bearer token), or answers with JSON when the request does not ask to stream. `refuse` answers a request with a status, headers and body of the test's choosing, and `headerDelayMs` holds every response back, for testing a client's errors and timeouts.
+
+## Upgrading from 0.7
+
+Nothing changes for code that does not use the new parts. New: `./models` (see [Models](#models)), and `createPipelineEvents` with its types in `./core` (see [Pipeline run events](#pipeline-run-events)). `startFakeUpstream` takes two new options, `refuse` and `headerDelayMs`, and exports `FakeUpstreamRefusal`; without them it behaves as before. The AI SDK packages are dev dependencies only, so installing the tag pulls in nothing new.
 
 ## Upgrading from 0.6
 
