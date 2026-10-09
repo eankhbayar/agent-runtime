@@ -21,6 +21,13 @@ export type ModelRoute<Policy extends object = {}> = Readonly<
  * the same text. Object properties whose value is undefined are left out, as
  * JSON.stringify does; anything JSON cannot carry exactly (undefined in an
  * array, a function, a bigint, a symbol, a non-finite number) throws.
+ *
+ * hk-legal's own `stable` (research-worker-contracts' tests, the worker's
+ * model-invocation.ts) writes an undefined property as `"key":undefined`
+ * instead. The two agree on every manifest without undefined fields, which
+ * is all of hk-legal's pinned routes and bundles, and differ on any with
+ * one: such a manifest digests differently here. Its invocation input
+ * digests, which hash records with optional fields, are not this scheme's.
  */
 export function stableJson(value: unknown): string {
   if (value === null || typeof value === "string" || typeof value === "boolean") {

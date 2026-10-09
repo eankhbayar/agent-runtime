@@ -9,9 +9,10 @@ import { formatOf, sdkBaseUrl, type ModelEndpoint } from "./endpoint.ts";
 
 /**
  * The settings `createOpenAICompatible`, `createOpenAI` and `createAnthropic`
- * all take. `name` is always set for OpenAI (`createOpenAICompatible`
- * requires one) and for Anthropic only when given, since it renames the
- * provider whose `providerOptions` a call reads.
+ * all take. `name` is `options.name`, else the endpoint's `provider`; with
+ * neither, OpenAI gets `openai-compatible` (`createOpenAICompatible` requires
+ * a name) and Anthropic none, keeping the SDK's own, since the name is the
+ * key a call's `providerOptions` sit under.
  */
 export type AiSdkProviderSettings = {
   baseURL: string;
@@ -29,7 +30,7 @@ export type AiSdkModelFactories<Model> = {
 
 export type AiSdkModelOptions = {
   apiKey: string;
-  /** The provider name. Default the endpoint's `provider`, then `openai-compatible` for OpenAI. */
+  /** The provider name. Default the endpoint's `provider`, then `openai-compatible` for OpenAI and none for Anthropic. */
   name?: string;
   headers?: Record<string, string>;
   /** The fetch the SDK calls; wrapped by `transformBody` when that is given. */

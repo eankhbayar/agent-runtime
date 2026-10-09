@@ -68,6 +68,9 @@ export function openAiUsage(usage: unknown): ModelUsage {
 /**
  * Messages `usage`: `input_tokens` excludes the cache, so the cache reads and
  * writes are added to it. Reasoning is not reported apart from output.
+ *
+ * hk-legal's kimi-provider.ts counts `input_tokens` alone. With prompt caching
+ * in use, `inputTokens` here is larger, and so is anything budgeted on it.
  */
 export function anthropicUsage(usage: unknown): ModelUsage {
   const root = record(usage);
@@ -95,10 +98,13 @@ export function addModelUsage(a: ModelUsage, b: ModelUsage): ModelUsage {
 const usd = (tokens: number, perMillion: number) => Number(((tokens * perMillion) / 1_000_000).toFixed(8));
 
 /**
- * The call's cost in US dollars, each part rounded to eight places. Output is
- * priced over output and reasoning tokens together. With no cache rates this
- * is input × input rate + (output + reasoning) × output rate, which is
- * hk-legal's pay-as-you-go equivalent.
+ * The call's cost in US dollars. Output is priced over output and reasoning
+ * tokens together. With no cache rates this is input × input rate +
+ * (output + reasoning) × output rate, hk-legal's pay-as-you-go equivalent.
+ *
+ * Each part is rounded to eight places and `total` is their rounded sum,
+ * where hk-legal's model-invocation.ts rounds only the total; totals can
+ * differ from its figures in the eighth place.
  */
 export function modelCost(usage: ModelUsage, pricing: ModelPricing): TurnUsage["cost"] {
   const uncached = Math.max(0, usage.inputTokens - usage.cacheReadTokens - usage.cacheWriteTokens);

@@ -1,4 +1,5 @@
 import { createAnthropic } from "@ai-sdk/anthropic";
+import { createOpenAI } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -8,7 +9,9 @@ import { aiSdkProviderSettings, bodyRewritingFetch, createAiSdkModel } from "./a
 import { modelEndpoint } from "./endpoint.ts";
 
 // The AI SDK packages are dev dependencies only: the adapter takes the app's
-// own factories, so these tests use the versions HKJC and hk-legal pin.
+// own factories. These are the versions the apps resolve: HKJC pins
+// @ai-sdk/openai-compatible 3.0.51; hk-legal's Convex takes @ai-sdk/openai
+// ^4.0.45 (createOpenAI().chat) and @ai-sdk/anthropic ^4.0.40.
 
 const KEY = "sk-test-key";
 let upstream: FakeUpstream | undefined;
@@ -57,6 +60,17 @@ describe("createAiSdkModel", () => {
     expect(request!.headers["x-api-key"]).toBe(KEY);
   });
 
+  it("builds hk-legal's createOpenAI().chat model the same way", async () => {
+    upstream = await startFakeUpstream({ apiKey: KEY });
+    const endpoint = modelEndpoint({ format: "openai", url: `${upstream.baseUrl}/chat/completions`, model: "gpt-6.1-sol", provider: "kimi" });
+    const model = createAiSdkModel(endpoint, { openai: (settings, id) => createOpenAI(settings).chat(id) }, { apiKey: KEY });
+    expect(model.provider).toBe("kimi.chat");
+    const result = await model.doGenerate({ prompt, maxOutputTokens: 64 });
+    expect(result.content).toEqual([{ type: "text", text: "Hello from the fake model." }]);
+    expect(upstream.requests[0]!.path).toBe("/v1/chat/completions");
+    expect(upstream.requests[0]!.headers.authorization).toBe(`Bearer ${KEY}`);
+  });
+
   it("rewrites the body the SDK sends, as hk-legal's kimiFetch does", async () => {
     upstream = await startFakeUpstream({ apiKey: KEY });
     const endpoint = modelEndpoint({ format: "openai", url: upstream.baseUrl, model: "gpt-6-luna" });
@@ -75,7 +89,7 @@ describe("createAiSdkModel", () => {
 });
 
 describe("aiSdkProviderSettings", () => {
-  it("names an OpenAI provider by default and leaves an Anthropic one unnamed", () => {
+  it("names an OpenAI provider by default and an Anthropic one only after its endpoint", () => {
     const openai = modelEndpoint({ format: "openai", url: "https://x/v1/chat/completions", model: "m" });
     const anthropic = modelEndpoint({ format: "anthropic", url: "https://y/v1/messages", model: "m" });
     expect(aiSdkProviderSettings(openai, { apiKey: KEY })).toEqual({
@@ -84,6 +98,8 @@ describe("aiSdkProviderSettings", () => {
       name: "openai-compatible",
     });
     expect(aiSdkProviderSettings(anthropic, { apiKey: KEY })).toEqual({ baseURL: "https://y/v1", apiKey: KEY });
+    // An endpoint's provider names either format's provider.
+    expect(aiSdkProviderSettings({ ...anthropic, provider: "kimi" }, { apiKey: KEY }).name).toBe("kimi");
     expect(() => aiSdkProviderSettings(openai, { apiKey: "" })).toThrow(/key/);
   });
 });

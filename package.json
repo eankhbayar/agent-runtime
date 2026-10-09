@@ -71,6 +71,7 @@
   },
   "devDependencies": {
     "@ai-sdk/anthropic": "4.0.59",
+    "@ai-sdk/openai": "4.0.72",
     "@ai-sdk/openai-compatible": "3.0.51",
     "@earendil-works/pi-coding-agent": "0.85.1",
     "@types/node": "^24",
