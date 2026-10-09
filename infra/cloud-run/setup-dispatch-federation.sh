@@ -14,7 +14,7 @@ set -euo pipefail
 # made again and replaces the provider's JWKS, so Convex must then be given the
 # new key.
 #
-# Needs gcloud, openssl and Node 22.18+, and this package built (dist/ is in an
+# Needs gcloud, openssl and Node 24+, and this package built (dist/ is in an
 # installed tag; run `pnpm build` in a checkout).
 
 help() {
