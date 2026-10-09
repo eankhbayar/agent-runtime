@@ -307,3 +307,82 @@ describe("callModel failures", () => {
     }
   });
 });
+
+describe("callModel and the app's own errors", () => {
+  it("rethrows what the app's callbacks throw as it is, never as a retryable code", async () => {
+    const { openai } = await start();
+    const bug = new Error("app bug");
+    for (const options of [
+      { onText: () => { throw bug; } },
+      { onProgress: () => { throw bug; } },
+      { onConnected: () => { throw bug; } },
+    ]) {
+      await expect(callModel(openai, { ...ask, stream: true }, { apiKey: KEY, ...options })).rejects.toBe(bug);
+    }
+  });
+
+  it("rethrows what classify throws as it is", async () => {
+    const { openai } = await start({ refuse: () => ({ status: 500 }) });
+    const bug = new Error("app bug");
+    await expect(callModel(openai, ask, { apiKey: KEY, classify: () => { throw bug; } })).rejects.toBe(bug);
+  });
+
+  it("rethrows an extraBody JSON cannot encode without calling the endpoint", async () => {
+    const { anthropic } = await start();
+    const error = await callModel(anthropic, { ...ask, extraBody: { seed: 1n } }, { apiKey: KEY }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(TypeError);
+    expect(error).not.toBeInstanceOf(ModelCallError);
+    expect(upstream!.requests).toHaveLength(0);
+  });
+});
+
+describe("callModel and an unread body", () => {
+  /** A fetch that ignores its signal, answering with a stream that sends `chunks` and then hangs. */
+  function hanging(chunks: string[]) {
+    const state = { cancelled: false };
+    const fetch: typeof globalThis.fetch = async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            for (const chunk of chunks) controller.enqueue(new TextEncoder().encode(chunk));
+          },
+          cancel() {
+            state.cancelled = true;
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    return { fetch, state };
+  }
+  const endpoint: ModelEndpoint = { format: "openai", baseUrl: "https://model.invalid/v1", model: "m" };
+  const chunk = (text: string) => `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`;
+
+  it("cancels the body when a timeout stops the call", async () => {
+    const { fetch, state } = hanging([chunk("partial")]);
+    const error = await failure(
+      callModel(endpoint, { ...ask, stream: true }, { apiKey: KEY, fetch, timeouts: { noProgressMs: 30 } }),
+    );
+    expect(error.code).toBe("no_progress_timeout");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(state.cancelled).toBe(true);
+  });
+
+  it("cancels the body when an event cannot be parsed", async () => {
+    const { fetch, state } = hanging(["data: {not json\n\n"]);
+    expect((await failure(callModel(endpoint, { ...ask, stream: true }, { apiKey: KEY, fetch }))).code).toBe(
+      "provider_response_invalid",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(state.cancelled).toBe(true);
+  });
+
+  it("cancels the body when an app callback throws", async () => {
+    const { fetch, state } = hanging([chunk("partial")]);
+    const bug = new Error("app bug");
+    await expect(
+      callModel(endpoint, { ...ask, stream: true }, { apiKey: KEY, fetch, onText: () => { throw bug; } }),
+    ).rejects.toBe(bug);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(state.cancelled).toBe(true);
+  });
+});

@@ -279,7 +279,10 @@ function sseData(event: string): unknown {
 /**
  * Calls the endpoint once. Resolves with the answer, or rejects with a
  * ModelCallError; the call is never retried here, since whether to retry is
- * the caller's policy (`error.retryable`, `error.retryAfterMs`).
+ * the caller's policy (`error.retryable`, `error.retryAfterMs`). An error
+ * thrown by the app's own code (`onText`, `onProgress`, `onConnected`,
+ * `classify`, an `extraBody` JSON cannot encode) is rethrown as it is, so an
+ * app bug never reads as a retryable network failure.
  */
 export async function callModel(
   endpoint: ModelEndpoint,
@@ -323,6 +326,22 @@ export async function callModel(
   if (options.signal?.aborted) cancel();
   else options.signal?.addEventListener("abort", cancel, { once: true });
 
+  /**
+   * A fetch or a body read. Its own rejection is the network's (DNS, TLS, a
+   * reset, a body cut off), or the abort a stop caused; neither is kept,
+   * since fetch's errors can quote the URL. Only these become
+   * `connection_failure`: an error the app's callbacks throw is the app's,
+   * and is rethrown as it is rather than turned into a retryable code.
+   */
+  const network = async <T>(promise: Promise<T>): Promise<T> => {
+    try {
+      return await race(promise);
+    } catch (error) {
+      if (error instanceof ModelCallError) throw error;
+      throw new ModelCallError(stopCode ?? "connection_failure");
+    }
+  };
+
   /** The body as text, chunk by chunk, up to `limit` bytes. */
   const readBody = async (
     response: Response,
@@ -334,19 +353,26 @@ export async function callModel(
     const decoder = new TextDecoder();
     let text = "";
     let bytes = 0;
-    for (;;) {
-      const { done, value } = await race(reader.read());
-      if (done) break;
-      progressed();
-      options.onProgress?.();
-      bytes += value.byteLength;
-      if (bytes > limit) {
-        void reader.cancel().catch(() => {});
-        throw new ModelCallError("provider_response_invalid");
+    let finished = false;
+    try {
+      for (;;) {
+        const { done, value } = await network(reader.read());
+        if (done) {
+          finished = true;
+          break;
+        }
+        progressed();
+        options.onProgress?.();
+        bytes += value.byteLength;
+        if (bytes > limit) throw new ModelCallError("provider_response_invalid");
+        const piece = decoder.decode(value, { stream: true });
+        if (onChunk) onChunk(piece);
+        else text += piece;
       }
-      const piece = decoder.decode(value, { stream: true });
-      if (onChunk) onChunk(piece);
-      else text += piece;
+    } finally {
+      // A stop, a bad event or an app callback left the body unread: close
+      // it, even when the fetch ignored its signal.
+      if (!finished) void reader.cancel().catch(() => {});
     }
     const rest = decoder.decode();
     if (onChunk) {
@@ -359,12 +385,13 @@ export async function callModel(
 
   try {
     if (stopCode) throw new ModelCallError(stopCode);
+    const body = JSON.stringify(requestBody(endpoint, request, options));
     const fetchModel = options.fetch ?? globalThis.fetch;
-    const response = await race(
+    const response = await network(
       fetchModel(endpointUrl(endpoint), {
         method: "POST",
         headers: requestHeaders(endpoint, options),
-        body: JSON.stringify(requestBody(endpoint, request, options)),
+        body,
         signal: controller.signal,
       }),
     );
@@ -374,11 +401,17 @@ export async function callModel(
     progressed();
 
     if (!response.ok) {
+      let text = "";
+      try {
+        text = await readBody(response, MAX_ERROR_BYTES);
+      } catch (error) {
+        // A body too large or cut off still fails with the status; a stop or an app error does not.
+        if (!(error instanceof ModelCallError) || stopCode) throw error;
+      }
       let provider: ProviderErrorInfo = {};
       try {
-        provider = providerErrorInfo(JSON.parse(await readBody(response, MAX_ERROR_BYTES)) as unknown);
-      } catch (error) {
-        if (stopCode) throw error;
+        provider = providerErrorInfo(JSON.parse(text) as unknown);
+      } catch {
         // An unreadable body still fails with the status.
       }
       const code =
@@ -410,11 +443,11 @@ export async function callModel(
       });
       if (buffer.trim()) consume(buffer);
     } else {
+      const text = await readBody(response, MAX_RESPONSE_BYTES);
       let value: unknown;
       try {
-        value = JSON.parse(await readBody(response, MAX_RESPONSE_BYTES)) as unknown;
-      } catch (error) {
-        if (error instanceof ModelCallError || stopCode) throw error;
+        value = JSON.parse(text) as unknown;
+      } catch {
         throw new ModelCallError("provider_response_invalid");
       }
       if (openai) openAiJson(value, answer);
@@ -435,11 +468,6 @@ export async function callModel(
       connectionMs,
       durationMs: now() - startedAt,
     };
-  } catch (error) {
-    if (stopCode) throw error instanceof ModelCallError && error.code === stopCode ? error : new ModelCallError(stopCode);
-    if (error instanceof ModelCallError) throw error;
-    // fetch's own errors (DNS, TLS, a reset, a body cut off) can quote the URL; none of it is kept.
-    throw new ModelCallError("connection_failure");
   } finally {
     clearTimeout(connectionTimer);
     clearTimeout(invocationTimer);
