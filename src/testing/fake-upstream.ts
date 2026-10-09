@@ -3,7 +3,8 @@
 // Messages at /v1/messages (key as x-api-key) and OpenAI Chat Completions at
 // /v1/chat/completions (key as Authorization: Bearer). It checks the key,
 // records each request, and streams its reply as SSE, one word per event,
-// `gapMs` apart.
+// `gapMs` apart. `refuse` answers a request with an error instead, and
+// `headerDelayMs` holds the response back, for testing a client's failures.
 
 import { createServer, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -21,6 +22,17 @@ export type FakeUpstreamOptions = {
   reply?: (body: Record<string, unknown>) => string;
   /** Milliseconds between streamed events. Default 0. */
   gapMs?: number;
+  /** Milliseconds before any response is written, headers included. Default 0. */
+  headerDelayMs?: number;
+  /** An error to answer a request with, after the key check; undefined to answer normally. */
+  refuse?: (request: FakeUpstreamRequest) => FakeUpstreamRefusal | undefined;
+};
+
+/** A refused request: the status, any headers (e.g. `retry-after`) and the body, JSON-encoded if not a string. */
+export type FakeUpstreamRefusal = {
+  status: number;
+  headers?: Record<string, string>;
+  body?: unknown;
 };
 
 export type FakeUpstream = {
@@ -108,11 +120,20 @@ export async function startFakeUpstream(options: FakeUpstreamOptions): Promise<F
       body = JSON.parse(raw || "{}") as Record<string, unknown>;
     } catch {}
     const url = new URL(req.url ?? "/", "http://upstream");
-    requests.push({ path: url.pathname, headers: req.headers, body });
+    const request = { path: url.pathname, headers: req.headers, body };
+    requests.push(request);
+    if (options.headerDelayMs) await new Promise((resolve) => setTimeout(resolve, options.headerDelayMs));
+    if (res.destroyed) return;
     const openai = url.pathname === "/v1/chat/completions";
     const key = openai ? /^Bearer (.*)$/.exec(req.headers.authorization ?? "")?.[1] : req.headers["x-api-key"];
     if (key !== options.apiKey) {
       res.writeHead(401, { "content-type": "application/json" }).end('{"error":"bad key"}');
+      return;
+    }
+    const refusal = options.refuse?.(request);
+    if (refusal) {
+      const text = typeof refusal.body === "string" ? refusal.body : JSON.stringify(refusal.body ?? {});
+      res.writeHead(refusal.status, { "content-type": "application/json", ...refusal.headers }).end(text);
       return;
     }
     if (url.pathname === "/v1/messages/count_tokens") {
