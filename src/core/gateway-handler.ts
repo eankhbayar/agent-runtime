@@ -4,6 +4,8 @@
 // either the Anthropic Messages format (`x-api-key`) or the OpenAI Chat
 // Completions format (`Authorization: Bearer`). The Docker gateway image
 // (gateway/server.ts) and the in-job gateway (gateway.ts) both serve it.
+// Given a project's data commands (../data), it also serves them at
+// GET /data and POST /data/<command>, for the `agent-data` CLI.
 //
 // This file imports nothing but Node, because gateway/gateway-handler.ts is a
 // copy of it that the gateway image runs on its own. Edit this one; a test
@@ -32,6 +34,19 @@ export type GatewayUpstream =
       baseUrl: string;
     };
 
+/**
+ * A project's data commands, as ../data's createDataRoutes makes them:
+ * the list for GET /data, and one call per POST /data/<command>.
+ */
+export type GatewayData = {
+  list: () => unknown;
+  call: (
+    command: string,
+    args: unknown,
+    grant: GatewayGrant,
+  ) => Promise<{ status: number; body: unknown }>;
+};
+
 export type GatewayHandlerOptions = GatewayUpstream & {
   /** The provider key, sent as `x-api-key` or `Authorization: Bearer`. Never reaches a sandbox. */
   apiKey: string;
@@ -41,6 +56,8 @@ export type GatewayHandlerOptions = GatewayUpstream & {
   log?: (entry: Record<string, unknown>) => void;
   /** Defaults to the global fetch. */
   fetch?: typeof fetch;
+  /** Serves these data commands at /data; without it /data is not found. */
+  data?: GatewayData;
 };
 
 export type GatewayHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
@@ -83,6 +100,26 @@ function runTokenOf(req: IncomingMessage, openai: boolean): string | undefined {
   return match?.[1];
 }
 
+/** The largest data call body read; arguments are a few flags. */
+const MAX_DATA_BODY = 64 * 1024;
+const DATA_COMMAND = /^\/data\/([a-z][a-z0-9-]*)$/;
+
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
+}
+
+/** The request body as text, or null once it passes `limit` bytes. */
+async function readBody(req: IncomingMessage, limit: number): Promise<string | null> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req as AsyncIterable<Buffer>) {
+    size += chunk.length;
+    if (size > limit) return null;
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 export function createGatewayHandler(options: GatewayHandlerOptions): GatewayHandler {
   const { apiKey } = options;
   const log = options.log ?? (() => {});
@@ -113,10 +150,58 @@ export function createGatewayHandler(options: GatewayHandlerOptions): GatewayHan
     return headers;
   };
 
+  // The CLI sends its run token as a bearer token whichever format the model uses.
+  const serveData = async (req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> => {
+    const data = options.data;
+    const command = DATA_COMMAND.exec(url.pathname)?.[1];
+    const listing = req.method === "GET" && url.pathname === "/data";
+    if (!data || !(listing || (req.method === "POST" && command))) {
+      sendJson(res, 404, { error: "not_found" });
+      return;
+    }
+    const token = runTokenOf(req, true) ?? runTokenOf(req, false);
+    const grant =
+      typeof token === "string" && RUN_TOKEN_PATTERN.test(token)
+        ? await options.grantFor(token).catch(() => null)
+        : null;
+    if (!grant) {
+      log({ path: url.pathname, status: 401, reason: "invalid_run_token" });
+      sendJson(res, 401, { error: "invalid_run_token" });
+      return;
+    }
+    if (listing) {
+      sendJson(res, 200, data.list());
+      return;
+    }
+    const text = await readBody(req, MAX_DATA_BODY);
+    if (text === null) {
+      sendJson(res, 413, { error: "The arguments are too large." });
+      return;
+    }
+    let args: unknown;
+    try {
+      args = text.trim() ? JSON.parse(text) : {};
+    } catch {
+      sendJson(res, 400, { error: "The arguments are not JSON." });
+      return;
+    }
+    try {
+      const reply = await data.call(command!, args, grant);
+      sendJson(res, reply.status, reply.body);
+    } catch (error) {
+      log({ runId: grant.runId, path: url.pathname, error: String(error) });
+      if (!res.headersSent) sendJson(res, 502, { error: "data_failed" });
+    }
+  };
+
   return async (req, res) => {
     const url = new URL(req.url ?? "/", "http://gateway");
     if (req.method === "GET" && url.pathname === "/healthz") {
       res.writeHead(200, { "content-type": "text/plain" }).end("ok");
+      return;
+    }
+    if (url.pathname === "/data" || url.pathname.startsWith("/data/")) {
+      await serveData(req, res, url);
       return;
     }
     const target = upstreamByPath.get(url.pathname);

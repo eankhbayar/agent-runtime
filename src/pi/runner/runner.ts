@@ -15,6 +15,10 @@
 //   RUN_LIMITS        optional JSON {wallClockMs, cpus, memoryMb}, echoed in
 //                     run_started so the trace can show usage against them
 //
+// When the gateway serves data commands (../../data), the runner lists them in
+// the system prompt and sets AGENT_DATA_URL and AGENT_DATA_TOKEN for the
+// `agent-data` CLI the agent calls them with.
+//
 // `--check` on the command line validates the image without calling a model.
 
 import { mkdir } from "node:fs/promises";
@@ -31,6 +35,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 import type { EmitRunEvent } from "../../contract/events.ts";
+import { dataPromptSection } from "../../data/commands.ts";
+import { loadDataCommands } from "./data.ts";
 import { createEmitter, forwardSessionEvent } from "./events.ts";
 import { registerModel, resolveModelConfig } from "./model-config.ts";
 
@@ -57,6 +63,8 @@ export type RunnerOptions = {
   check?: (ctx: RunnerContext) => Promise<Record<string, unknown>>;
   env?: NodeJS.ProcessEnv;
   argv?: readonly string[];
+  /** For the data command list; defaults to the global fetch. */
+  fetch?: typeof fetch;
 };
 
 /** The limits the dispatcher gave this run, echoed back for the trace view. */
@@ -119,6 +127,16 @@ async function run(options: RunnerOptions, emit: EmitRunEvent): Promise<void> {
       ? { ...catalogModel, baseUrl: env.LLM_BASE_URL }
       : catalogModel;
 
+  // pi's bash tool runs commands with process.env, so the CLI finds these there.
+  const data = await loadDataCommands(env, options.fetch);
+  if (data) {
+    process.env.AGENT_DATA_URL = data.url;
+    process.env.AGENT_DATA_TOKEN = data.token;
+  }
+  const systemPrompt = [options.systemPrompt(ctx), data ? dataPromptSection(data.list) : ""]
+    .filter(Boolean)
+    .join("\n\n");
+
   // No discovery: no AGENTS.md, skills, extensions or prompt templates from
   // the image or the workspace can change the agent's instructions.
   const resourceLoader: ResourceLoader = {
@@ -127,7 +145,7 @@ async function run(options: RunnerOptions, emit: EmitRunEvent): Promise<void> {
     getPrompts: () => ({ prompts: [], diagnostics: [] }),
     getThemes: () => ({ themes: [], diagnostics: [] }),
     getAgentsFiles: () => ({ agentsFiles: [] }),
-    getSystemPrompt: () => options.systemPrompt(ctx),
+    getSystemPrompt: () => systemPrompt,
     getSystemPromptSource: () => undefined,
     getAppendSystemPrompt: () => [],
     getAppendSystemPromptSources: () => [],
@@ -160,6 +178,7 @@ async function run(options: RunnerOptions, emit: EmitRunEvent): Promise<void> {
     model: `${model.provider}/${model.id}`,
     sessionFile: session.sessionFile,
     limits: runLimits(env),
+    dataCommands: data?.list.commands.map((command) => command.name) ?? [],
   });
   const unsubscribe = session.subscribe((event) => forwardSessionEvent(event, emit));
   try {

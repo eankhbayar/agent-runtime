@@ -8,7 +8,12 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Duplex } from "node:stream";
 
-import { createGatewayHandler, type GatewayGrant, type GatewayUpstream } from "./gateway-handler.ts";
+import {
+  createGatewayHandler,
+  type GatewayData,
+  type GatewayGrant,
+  type GatewayUpstream,
+} from "./gateway-handler.ts";
 import type { TokenGrant } from "./run.ts";
 
 /** Run tokens held in this process, for a gateway in this process. */
@@ -48,6 +53,8 @@ export type InProcessGatewayOptions = GatewayUpstream & {
   log?: (entry: Record<string, unknown>) => void;
   /** Defaults to the global fetch. */
   fetch?: typeof fetch;
+  /** The project's data commands, from ../data's createDataRoutes, served at /data. */
+  data?: GatewayData;
 };
 
 export type InProcessGateway = TokenGrant & {
@@ -89,6 +96,7 @@ export function createInProcessGateway(options: InProcessGatewayOptions): InProc
       grantFor: tokens.lookup,
       log: options.log ?? defaultLog,
       fetch: options.fetch,
+      data: options.data,
     }),
   );
   const streams = new Set<Duplex>();

@@ -9,6 +9,7 @@ src/contract/           run events, the JSON-lines emitter and parser, and the f
 src/core/               runs on the host, for every runtime: `executeRun`, `EventSink`, `RunStore`, `SessionStore`, the `SandboxProvider` interface, the in-process gateway, the reaper, `printRunEvent`, `createPipelineEvents`
 src/models/             model endpoints, one chat call in either format, usage and cost, route digests, an AI SDK adapter. No Node APIs, so Convex can import it.
 src/job/                `runJob`: one job execution claims, works and finishes one run
+src/data/               data commands: the reads a project lets its agent make, served at the gateway's /data and called with the `agent-data` CLI. The definitions have no Node APIs, so Convex can import them.
 src/dispatch/cloud-run/ for an app's Convex: Google tokens without a key, starting a Cloud Run Job execution, the redispatch policy. No Node APIs.
 src/providers/docker/   the Docker `SandboxProvider`, `docker stats` sampling, and gateway control (`createGateway`)
 src/providers/cloud-run/ the Cloud Run `SandboxProvider` for a job's `sandbox` CLI, and the stdio bridge with its in-sandbox shim
@@ -276,6 +277,62 @@ const model = createAiSdkModel(endpoint, {
 
 The settings carry `baseURL` (`sdkBaseUrl`), `apiKey`, `headers`, a `fetch`, and a `name`: `options.name`, else the endpoint's `provider`, in either format. With neither, OpenAI gets `openai-compatible` (`createOpenAICompatible` requires a name) and Anthropic gets none and keeps the SDK's own (`anthropic.messages`). Since the name is the key a call's `providerOptions` sit under, leave `provider` off an Anthropic endpoint whose calls pass options under `anthropic`. `transformBody` rewrites each JSON request body before it is sent, as hk-legal's `kimiFetch` does (`bodyRewritingFetch` is the wrapper on its own); a body it cannot parse or rewrite goes unchanged, and a failed request is not sent twice. `aiSdkProviderSettings` returns the settings for an app that calls a factory itself (`createOpenAI(settings).chat(id)`). It is tested against `@ai-sdk/openai-compatible` 3.0.51 (HKJC pins it), `@ai-sdk/openai` 4.0.72 with `createOpenAI(settings).chat(id)` and `@ai-sdk/anthropic` 4.0.59 (hk-legal's Convex takes `^4.0.45` and `^4.0.40`), all as dev dependencies.
 
+## Data commands
+
+An agent in a sandbox has no network and holds no secrets, so it cannot read a project's database. Data commands give it named, read-only ways in that the project chooses. Each call goes from the sandbox to the job's gateway with the run's token, and the project's handler answers it for that run alone. The deployment key stays in the job.
+
+```text
+sandbox                          job                                         the project's backend
+pi ─ bash ─► agent-data thread-history --limit 5
+               │ POST /data/thread-history, Bearer <run token>, over the bridge
+               ▼
+             gateway ─► token → runId, arguments checked ─► handle(command, args, { runId }) ─► e.g. a Convex query
+```
+
+**Declare the commands** once, with `defineDataCommands` from `./data`. Names and arguments are lower-case kebab-case, and an argument is a string, a number or a boolean:
+
+```ts
+import { createDataRoutes, DataCommandError, defineDataCommands } from "@eankhbayar/agent-runtime/data";
+
+export const dataCommands = defineDataCommands({
+  "thread-history": {
+    description: "Earlier questions and answers in this thread, oldest first",
+    args: { limit: { type: "number", default: 10, description: "How many turns, at most 20" } },
+  },
+});
+```
+
+**Serve them** from the in-process gateway. `handle` gets the checked arguments, with defaults filled in, and the run the token belongs to; what it returns is sent back as JSON:
+
+```ts
+const gateway = createInProcessGateway({
+  ...llm,
+  apiKey,
+  data: createDataRoutes({
+    commands: dataCommands,
+    handle: (command, args, { runId }) => convex.query(api.agentData.threadHistory, { secret, runId, ...args }),
+  }),
+});
+```
+
+Throw `DataCommandError(message, status)` for an answer the agent should see, such as "no races that day". Anything else thrown is logged and reaches the agent as "`<command>` failed.", so no connection string or stack ends up in its context. Each run gets `maxCallsPerRun` calls (50), each call `timeoutMs` (20 s), and a result of at most `maxResultChars` (256 KiB of JSON); `log` gets one entry per call. The handler decides what a run may see: check in the backend that the run is live and scope every read to it, since the token proves only which run is asking.
+
+**In the sandbox** nothing changes for the project. At the start of a run `runAgent` asks the gateway for the commands. If there are some, it appends a "Live data" section to the system prompt with each command's usage, sets `AGENT_DATA_URL` and `AGENT_DATA_TOKEN` for the CLI, and lists the names in `run_started` as `dataCommands`. The agent calls them from bash:
+
+```sh
+agent-data --help
+agent-data thread-history --limit 5
+```
+
+The CLI is this package's `dist/data/cli.js` (`bin: agent-data`). An image that copies the package in rather than installing it puts it on the PATH itself:
+
+```dockerfile
+RUN printf '#!/bin/sh\nexec node /opt/runner/node_modules/@eankhbayar/agent-runtime/dist/data/cli.js "$@"\n' \
+    > /usr/local/bin/agent-data && chmod +x /usr/local/bin/agent-data
+```
+
+The calls show in the trace as the agent's bash tool calls, with the JSON as their output. The Docker gateway image serves no data commands: `/data` is not found there, and the runner goes on without them.
+
 ## Stores
 
 `EventSink` is all `executeRun` writes to. A worker that claims runs itself, such as a job started for one run, uses a `RunStore`: `claim({ runId, idempotencyKey })` returns a `ClaimedRun` that is the run's sink, with the app's payload, `heartbeat()` and `finish(ending)`. `executeRun` never beats or finishes, so its caller does both, usually through `runJob` (see Jobs); a store fails a run that goes quiet (HKJC's after 90 s).
@@ -467,6 +524,10 @@ Everything a sandbox leaves behind is treated as hostile. `download` runs `tar` 
 ### Testing
 
 `createFakeSandboxCli()` from `./testing` writes an executable that behaves as the real CLI does where a test can tell (it loses exit codes, keeps a command running when killed, records every call), to pass as `sandboxBin`; commands run on the test's host with paths inside binds rewritten, and limits are recorded but not applied. `startFakeUpstream({ apiKey })` is a model endpoint that checks the key and streams its reply as SSE: Messages at its `messagesUrl` (key as `x-api-key`), and Chat Completions under its `baseUrl` (key as a bearer token), or answers with JSON when the request does not ask to stream. `refuse` answers a request with a status, headers and body of the test's choosing, and `headerDelayMs` holds every response back, for testing a client's errors and timeouts.
+
+## Upgrading from 0.9
+
+Nothing changes unless you pass `data` to `createInProcessGateway` (see [Data commands](#data-commands)). New: `./data` (`defineDataCommands`, `createDataRoutes`, `DataCommandError`, `parseDataArgs`, `dataPromptSection`), the `agent-data` CLI, `GatewayData` and the `data` option in `./core`, and `fetch` in `runAgent`'s options. The runner now makes one `GET /data` to the gateway at the start of each run; on the Docker gateway that is a 404, and the run goes on as before. The gateway image's handler gained the route but serves nothing on it, so rebuilding the image is optional.
 
 ## Upgrading from 0.7
 
