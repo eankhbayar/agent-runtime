@@ -1,7 +1,7 @@
 {
   "name": "@eankhbayar/agent-runtime",
-  "version": "0.9.0",
-  "description": "Runtimes for sandboxed coding agents: the run-event contract, executeRun and the store interfaces, pipeline run events, a shared model client, a job harness and Cloud Run dispatch, Docker and Cloud Run sandbox providers, the egress gateway, and the pi runtime's in-sandbox runner.",
+  "version": "0.10.0",
+  "description": "Runtimes for sandboxed coding agents: the run-event contract, executeRun and the store interfaces, pipeline run events, a shared model client, a job harness and Cloud Run dispatch, Docker and Cloud Run sandbox providers, the egress gateway with project data commands and the agent-data CLI, and the pi runtime's in-sandbox runner.",
   "license": "UNLICENSED",
   "private": true,
   "type": "module",
@@ -11,6 +11,9 @@
     "gateway",
     "infra"
   ],
+  "bin": {
+    "agent-data": "dist/data/cli.js"
+  },
   "exports": {
     "./contract": {
       "types": "./dist/contract/index.d.ts",
@@ -44,6 +47,10 @@
       "types": "./dist/models/index.d.ts",
       "default": "./dist/models/index.js"
     },
+    "./data": {
+      "types": "./dist/data/index.d.ts",
+      "default": "./dist/data/index.js"
+    },
     "./testing": {
       "types": "./dist/testing/index.d.ts",
       "default": "./dist/testing/index.js"
@@ -52,7 +59,7 @@
   },
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
-    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.contract.json && tsc -p tsconfig.dispatch.json && tsc -p tsconfig.models.json",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.contract.json && tsc -p tsconfig.dispatch.json && tsc -p tsconfig.models.json && tsc -p tsconfig.data.json",
     "test": "vitest run",
     "ready": "pnpm typecheck && pnpm test && pnpm build",
     "release": "node scripts/release.mjs"
