@@ -17,7 +17,8 @@
 //
 // When the gateway serves data commands (../../data), the runner lists them in
 // the system prompt and sets AGENT_DATA_URL and AGENT_DATA_TOKEN for the
-// `agent-data` CLI the agent calls them with.
+// `agent-data` CLI the agent calls them with, or, with `dataAccess: "tools"`,
+// offers each as a typed tool (data-tools.ts).
 //
 // `--check` on the command line validates the image without calling a model.
 
@@ -37,6 +38,7 @@ import {
 import type { EmitRunEvent } from "../../contract/events.ts";
 import { dataPromptSection } from "../../data/commands.ts";
 import { loadDataCommands } from "./data.ts";
+import { createDataTools, dataToolsPromptSection } from "./data-tools.ts";
 import { createEmitter, forwardSessionEvent } from "./events.ts";
 import { registerModel, resolveModelConfig } from "./model-config.ts";
 
@@ -65,6 +67,12 @@ export type RunnerOptions = {
   argv?: readonly string[];
   /** For the data command list; defaults to the global fetch. */
   fetch?: typeof fetch;
+  /**
+   * How the agent calls the gateway's data commands: `cli` (default) through
+   * the `agent-data` CLI in bash, or `tools` as one typed tool per command,
+   * for an agent without bash.
+   */
+  dataAccess?: "cli" | "tools";
 };
 
 /** The limits the dispatcher gave this run, echoed back for the trace view. */
@@ -127,15 +135,15 @@ async function run(options: RunnerOptions, emit: EmitRunEvent): Promise<void> {
       ? { ...catalogModel, baseUrl: env.LLM_BASE_URL }
       : catalogModel;
 
-  // pi's bash tool runs commands with process.env, so the CLI finds these there.
   const data = await loadDataCommands(env, options.fetch);
-  if (data) {
+  const dataAsTools = options.dataAccess === "tools";
+  // pi's bash tool runs commands with process.env, so the CLI finds these there.
+  if (data && !dataAsTools) {
     process.env.AGENT_DATA_URL = data.url;
     process.env.AGENT_DATA_TOKEN = data.token;
   }
-  const systemPrompt = [options.systemPrompt(ctx), data ? dataPromptSection(data.list) : ""]
-    .filter(Boolean)
-    .join("\n\n");
+  const dataSection = !data ? "" : dataAsTools ? dataToolsPromptSection(data.list) : dataPromptSection(data.list);
+  const systemPrompt = [options.systemPrompt(ctx), dataSection].filter(Boolean).join("\n\n");
 
   // No discovery: no AGENTS.md, skills, extensions or prompt templates from
   // the image or the workspace can change the agent's instructions.
@@ -153,7 +161,13 @@ async function run(options: RunnerOptions, emit: EmitRunEvent): Promise<void> {
     reload: async () => {},
   };
 
-  const customTools = options.customTools?.(ctx) ?? [];
+  const customTools = [
+    ...(options.customTools?.(ctx) ?? []),
+    ...(data && dataAsTools ? createDataTools(data, options.fetch) : []),
+  ];
+  const names = [...(options.builtinTools ?? BUILTIN_TOOLS), ...customTools.map((tool) => tool.name)];
+  const clash = names.find((name, i) => names.indexOf(name) !== i);
+  if (clash) throw new Error(`Two tools are named ${clash}`);
   // Session JSONL lives in the workspace so a paused sandbox keeps it and the
   // dispatcher can copy it out as a checkpoint.
   const sessionDir = path.join(workspace, ".sessions");
@@ -164,7 +178,7 @@ async function run(options: RunnerOptions, emit: EmitRunEvent): Promise<void> {
     thinkingLevel,
     modelRuntime,
     resourceLoader,
-    tools: [...(options.builtinTools ?? BUILTIN_TOOLS), ...customTools.map((tool) => tool.name)],
+    tools: names,
     customTools,
     sessionManager: SessionManager.continueRecent(workspace, sessionDir),
     settingsManager: SettingsManager.inMemory({

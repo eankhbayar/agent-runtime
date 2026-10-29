@@ -1,6 +1,7 @@
 export { createEmitter, forwardSessionEvent } from "./events.ts";
 export { BUILTIN_TOOLS, runAgent, type RunnerContext, type RunnerOptions } from "./runner.ts";
 export { createSaveOutputTool } from "./save-output.ts";
+export { createDataTools, dataToolName, dataToolsPromptSection } from "./data-tools.ts";
 export {
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_MAX_TOKENS,
