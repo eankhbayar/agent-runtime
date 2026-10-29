@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { createInProcessGateway, type InProcessGateway } from "../core/gateway.ts";
 import { loadDataCommands } from "../pi/runner/data.ts";
+import { createDataTools, dataToolsPromptSection } from "../pi/runner/data-tools.ts";
 import { formatHelp, parseArgv, runCli } from "./cli.ts";
 import {
   dataPromptSection,
@@ -235,6 +236,36 @@ describe("the gateway's /data route, through the CLI", () => {
     expect(loaded).toEqual({ list: describeDataCommands(commands), url, token });
     expect(await loadDataCommands({ LLM_BASE_URL: `${url}/v1` })).toBeNull();
     expect(await loadDataCommands({ LLM_BASE_URL: "http://127.0.0.1:1", LLM_API_KEY: token })).toBeNull();
+  });
+
+  it("offers each command as a typed tool that calls it for the token's run", async () => {
+    const { url, token } = await start();
+    const loaded = await loadDataCommands({ LLM_BASE_URL: `${url}/v1`, LLM_API_KEY: token });
+    const tools = createDataTools(loaded!);
+    expect(tools.map((tool) => tool.name)).toEqual(["thread_history", "race"]);
+
+    const history = tools[0]!;
+    expect(history.parameters).toMatchObject({
+      properties: { limit: { type: "number", description: "How many turns" }, full: { type: "boolean" } },
+    });
+    expect((history.parameters as { required?: string[] }).required ?? []).toEqual([]);
+    expect((tools[1]!.parameters as { required?: string[] }).required).toEqual(["date"]);
+
+    const ran = await history.execute("call_1", { limit: 4, full: undefined }, undefined, undefined, undefined!);
+    expect(JSON.parse((ran.content[0] as { text: string }).text)).toEqual({
+      command: "thread-history",
+      args: { limit: 4 },
+      runId: "run_7",
+    });
+
+    await expect(tools[1]!.execute("call_2", {}, undefined, undefined, undefined!)).rejects.toThrow(
+      "--date is required.",
+    );
+
+    const section = dataToolsPromptSection(loaded!.list);
+    expect(section).toContain("- `thread_history`: Earlier questions and answers in this thread");
+    expect(section).not.toContain("agent-data");
+    expect(dataToolsPromptSection({ commands: [] })).toBe("");
   });
 });
 

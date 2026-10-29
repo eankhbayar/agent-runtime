@@ -333,6 +333,8 @@ RUN printf '#!/bin/sh\nexec node /opt/runner/node_modules/@eankhbayar/agent-runt
 
 The calls show in the trace as the agent's bash tool calls, with the JSON as their output. The Docker gateway image serves no data commands: `/data` is not found there, and the runner goes on without them.
 
+**Without bash**, pass `dataAccess: "tools"` to `runAgent`. Each command becomes a typed tool named after it with `_` for `-` (`thread-history` is `thread_history`), whose parameters are the command's arguments, and the "Live data" section lists the tools instead of the CLI. A call goes to the same `/data` route with the run's token, so the gateway checks it as before; a refused call is the tool's error. The CLI's variables are not set. A tool named like a built-in or custom tool stops the run before it starts. `createDataTools` and `dataToolsPromptSection` are exported for a runner of its own.
+
 ## Stores
 
 `EventSink` is all `executeRun` writes to. A worker that claims runs itself, such as a job started for one run, uses a `RunStore`: `claim({ runId, idempotencyKey })` returns a `ClaimedRun` that is the run's sink, with the app's payload, `heartbeat()` and `finish(ending)`. `executeRun` never beats or finishes, so its caller does both, usually through `runJob` (see Jobs); a store fails a run that goes quiet (HKJC's after 90 s).
@@ -524,6 +526,10 @@ Everything a sandbox leaves behind is treated as hostile. `download` runs `tar` 
 ### Testing
 
 `createFakeSandboxCli()` from `./testing` writes an executable that behaves as the real CLI does where a test can tell (it loses exit codes, keeps a command running when killed, records every call), to pass as `sandboxBin`; commands run on the test's host with paths inside binds rewritten, and limits are recorded but not applied. `startFakeUpstream({ apiKey })` is a model endpoint that checks the key and streams its reply as SSE: Messages at its `messagesUrl` (key as `x-api-key`), and Chat Completions under its `baseUrl` (key as a bearer token), or answers with JSON when the request does not ask to stream. `refuse` answers a request with a status, headers and body of the test's choosing, and `headerDelayMs` holds every response back, for testing a client's errors and timeouts.
+
+## Upgrading from 0.10
+
+Nothing changes unless you pass `dataAccess: "tools"` to `runAgent` (see [Data commands](#data-commands)). New in `./pi/runner`: `createDataTools`, `dataToolName` and `dataToolsPromptSection`. `runAgent` now refuses two tools with the same name.
 
 ## Upgrading from 0.9
 
